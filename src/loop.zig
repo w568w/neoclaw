@@ -283,12 +283,16 @@ const Agent = struct {
 
     /// Waits until at least one signal is present, then returns all signals
     /// by swapping the queue into a local copy. Caller owns the returned list
-    /// and must deinit each signal.
-    fn waitSignals(self: *Agent) std.ArrayList(Signal) {
+    /// and must deinit each signal. Returns null on runtime shutdown (killed).
+    fn waitSignals(self: *Agent) ?std.ArrayList(Signal) {
         const io = self.runtime.io;
         self.signal_mutex.lockUncancelable(io);
-        while (self.signals.items.len == 0) {
+        while (self.signals.items.len == 0 and !self.runtime.shutdown) {
             self.signal_cond.waitUncancelable(io, &self.signal_mutex);
+        }
+        if (self.signals.items.len == 0) {
+            self.signal_mutex.unlock(io);
+            return null;
         }
         const batch = self.signals;
         self.signals = .empty;
@@ -496,11 +500,12 @@ pub const Runtime = struct {
         self.mutex.lockUncancelable(self.io);
         self.shutdown = true;
         self.inbox_cond.broadcast(self.io);
+        // Send cancel signals and wake agents while holding mutex,
+        // preventing runtimeMain from concurrently modifying the agents map
+        // (createAgent also acquires mutex before agents.put).
+        for (self.agents.values()) |agent| self.deliverSignal(agent, .cancel) catch {};
         self.mutex.unlock(self.io);
         self.event_log.signalShutdown();
-
-        // Send cancel signal to all agents so they exit their main loops.
-        for (self.agents.values()) |agent| _ = self.deliverSignal(agent, .cancel);
 
         if (self.runtime_thread) |thread| thread.join();
         self.worker_group.await(self.io) catch {};
@@ -673,12 +678,15 @@ pub const Runtime = struct {
         const accepted_seq = try self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .request_id = request_id } });
         debugLog("submit_query agent={d} request={d}", .{ agent.id, request_id });
 
-        // Ownership of text transfers to signal (or freed on delivery failure).
-        _ = self.deliverSignal(agent, .{ .request = .{
+        // Ownership of text transfers to signal (freed on delivery failure).
+        self.deliverSignal(agent, .{ .request = .{
             .id = request_id,
             .text = msg.text.?,
             .priority = msg.priority,
-        } });
+        } }) catch {
+            msg.text = null;
+            return error.OutOfMemory;
+        };
         msg.text = null;
 
         return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = agent.id, .request_id = request_id } };
@@ -689,13 +697,16 @@ pub const Runtime = struct {
         const accepted_seq = try self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .request_id = null } });
         debugLog("submit_reply agent={d} syscall={d}", .{ msg.agent_id, msg.syscall_id });
 
-        // Ownership of text transfers to signal (or freed on delivery failure).
-        _ = self.deliverSignal(agent, .{ .tool_done = .{
+        // Ownership of text transfers to signal (freed on delivery failure).
+        self.deliverSignal(agent, .{ .tool_done = .{
             .syscall_id = msg.syscall_id,
             .output = msg.text.?,
             .ok = true,
             .detached = false,
-        } });
+        } }) catch {
+            msg.text = null;
+            return error.OutOfMemory;
+        };
         msg.text = null;
 
         return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = msg.agent_id, .request_id = null } };
@@ -705,35 +716,36 @@ pub const Runtime = struct {
         const agent = self.getAgent(msg.agent_id) orelse return error.UnknownAgent;
         debugLog("cancel agent={d}", .{msg.agent_id});
 
-        _ = self.deliverSignal(agent, .cancel);
+        self.deliverSignal(agent, .cancel) catch {};
 
         return .{ .cancel_ok = .{ .accepted_seq = self.event_log.peekNextSeq(), .agent_id = msg.agent_id } };
     }
 
-    /// Returns true if ownership of msg.output was transferred to the agent.
+    /// Delivers tool_done to the agent. On success, ownership of msg.output is transferred.
+    /// On failure (unknown agent or OOM), returns false and output is freed.
     fn dispatchToolDone(self: *Runtime, msg: @FieldType(InboxItem.Msg, "tool_done")) bool {
         const agent = self.getAgent(msg.agent_id) orelse return false;
-        return self.deliverSignal(agent, .{ .tool_done = .{
+        self.deliverSignal(agent, .{ .tool_done = .{
             .syscall_id = msg.syscall_id,
             .output = msg.output.?,
             .ok = msg.ok,
             .detached = msg.detached,
-        } });
+        } }) catch return false;
+        return true;
     }
 
-    /// Returns true if signal was delivered (ownership transferred).
-    /// On failure, owned payload is freed.
-    fn deliverSignal(self: *Runtime, agent: *Agent, signal: Signal) bool {
+    /// Delivers signal to agent's signal queue (ownership transferred).
+    /// On failure, owned payload within the signal is freed before returning error.
+    fn deliverSignal(self: *Runtime, agent: *Agent, signal: Signal) Allocator.Error!void {
         agent.signal_mutex.lockUncancelable(self.io);
         agent.signals.append(self.allocator, signal) catch {
             agent.signal_mutex.unlock(self.io);
             var sig = signal;
             sig.deinit(self.allocator);
-            return false;
+            return error.OutOfMemory;
         };
         agent.signal_cond.signal(self.io);
         agent.signal_mutex.unlock(self.io);
-        return true;
     }
 
     fn createAgent(self: *Runtime) !*Agent {
@@ -751,6 +763,9 @@ pub const Runtime = struct {
             errdefer self.allocator.free(system_prompt);
             try agent.history.append(self.allocator, .{ .role = .system, .content = system_prompt });
         }
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.agents.put(self.allocator, agent.id, agent);
 
         // Spawn the agent's process.
@@ -769,6 +784,7 @@ pub const Runtime = struct {
         debugLog("spawn_tool_worker agent={d} syscall={d} detached={}", .{ agent_id, syscall_id, detached });
         const ctx = self.allocator.create(ToolWorkerCtx) catch {
             job.deinit(self.allocator);
+            self.sendToolFailure(agent_id, syscall_id, detached);
             return;
         };
         ctx.* = .{
@@ -781,8 +797,29 @@ pub const Runtime = struct {
         };
         self.worker_group.concurrent(self.io, toolWorkerMain, .{ctx}) catch {
             ctx.deinit();
+            self.sendToolFailure(agent_id, syscall_id, detached);
             return;
         };
+    }
+
+    fn sendToolFailure(self: *Runtime, agent_id: AgentId, syscall_id: SyscallId, detached: bool) void {
+        const agent = self.getAgent(agent_id) orelse return;
+        const output = self.allocator.dupe(u8, "[tool worker failed to spawn]") catch {
+            // Extreme OOM: deliver signal with empty output.
+            self.deliverSignal(agent, .{ .tool_done = .{
+                .syscall_id = syscall_id,
+                .output = &.{},
+                .ok = false,
+                .detached = detached,
+            } }) catch {};
+            return;
+        };
+        self.deliverSignal(agent, .{ .tool_done = .{
+            .syscall_id = syscall_id,
+            .output = output,
+            .ok = false,
+            .detached = detached,
+        } }) catch {};
     }
 
 };
@@ -796,9 +833,9 @@ fn agentMain(agent: *Agent) std.Io.Cancelable!void {
     const runtime = agent.runtime;
     const allocator = agent.allocator;
 
-    while (!runtime.shutdown) {
-        // Wait for a request signal.
-        var batch = agent.waitSignals();
+    while (true) {
+        // Wait for a request signal. null = shutdown.
+        var batch = agent.waitSignals() orelse break;
         defer {
             for (batch.items) |*sig| sig.deinit(allocator);
             batch.deinit(allocator);
@@ -846,25 +883,24 @@ fn agentMain(agent: *Agent) std.Io.Cancelable!void {
         }
 
         if (request == null) {
-            if (runtime.shutdown) break;
             continue;
         }
 
         // Put remaining requests back into signal queue for later (ownership transfer).
         for (hi_requests.items) |*req| {
-            _ = runtime.deliverSignal(agent, .{ .request = .{
+            runtime.deliverSignal(agent, .{ .request = .{
                 .id = req.id,
                 .text = req.text,
                 .priority = req.priority,
-            } });
+            } }) catch {};
             req.text = null;
         }
         for (lo_requests.items) |*req| {
-            _ = runtime.deliverSignal(agent, .{ .request = .{
+            runtime.deliverSignal(agent, .{ .request = .{
                 .id = req.id,
                 .text = req.text,
                 .priority = req.priority,
-            } });
+            } }) catch {};
             req.text = null;
         }
 
@@ -913,8 +949,8 @@ fn processRequest(agent: *Agent, request: *const Request) !void {
         }
 
         // Record assistant message with tool calls in history.
-        const assistant_calls = try llm.cloneToolCallsOwnedSlice(allocator, response.tool_calls);
-        errdefer llm.freeToolCallsOwned(allocator, assistant_calls);
+        const assistant_calls = try llm.cloneToolCalls(allocator, response.tool_calls);
+        errdefer llm.freeToolCalls(allocator, assistant_calls);
         try agent.history.append(allocator, .{ .role = .assistant, .content = null, .tool_calls = assistant_calls });
 
         // Execute each tool call (syscall).
@@ -946,7 +982,7 @@ fn recordToolResult(agent: *Agent, syscall_id: SyscallId, tc_id: []const u8, out
 }
 
 /// Issue a syscall for a single tool call and wait for the result.
-fn executeSyscall(agent: *Agent, request_id: RequestId, tc: openai.ToolCallOwned) !void {
+fn executeSyscall(agent: *Agent, request_id: RequestId, tc: openai.ToolCall) !void {
     const runtime = agent.runtime;
     const allocator = agent.allocator;
     const syscall_id = agent.nextSyscallId();
@@ -971,6 +1007,7 @@ fn executeSyscall(agent: *Agent, request_id: RequestId, tc: openai.ToolCallOwned
                 .worker => |job| {
                     _ = try runtime.event_log.append(.{ .tool_waiting = .{ .agent_id = agent.id, .syscall_id = syscall_id } });
                     runtime.spawnToolWorker(agent.id, syscall_id, job, false);
+                    start_result = undefined;
                 },
                 .user => |user_wait| {
                     _ = try runtime.event_log.append(.{ .waiting_user = .{ .agent_id = agent.id, .syscall_id = syscall_id, .question = user_wait.question } });
@@ -994,13 +1031,14 @@ fn executeSyscall(agent: *Agent, request_id: RequestId, tc: openai.ToolCallOwned
 
 /// Wait for a tool_done signal matching the given syscall_id.
 /// Detached completions for other syscalls are queued as pending interrupts.
-fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: RequestId) struct { output: []u8, ok: bool } {
+fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: RequestId) struct { output: []const u8, ok: bool } {
     const runtime = agent.runtime;
     const allocator = agent.allocator;
     _ = request_id;
 
     while (true) {
-        var batch = agent.waitSignals();
+        var batch = agent.waitSignals() orelse
+            return .{ .output = &.{}, .ok = false };
         defer {
             for (batch.items) |*sig| sig.deinit(allocator);
             batch.deinit(allocator);
@@ -1027,11 +1065,11 @@ fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: Request
                 },
                 .request => |*req| {
                     // Re-queue requests that arrive while waiting (ownership transfer).
-                    _ = runtime.deliverSignal(agent, .{ .request = .{
+                    runtime.deliverSignal(agent, .{ .request = .{
                         .id = req.id,
                         .text = req.text,
                         .priority = req.priority,
-                    } });
+                    } }) catch {};
                     req.text = null;
                 },
             }
@@ -1052,11 +1090,11 @@ fn queueDetachedInterrupt(agent: *Agent, td: @FieldType(Signal, "tool_done")) vo
     const text = out.toOwnedSlice() catch return;
     const request_id = agent.next_request_id;
     agent.next_request_id += 1;
-    _ = agent.runtime.deliverSignal(agent, .{ .request = .{
+    agent.runtime.deliverSignal(agent, .{ .request = .{
         .id = request_id,
         .text = text,
         .priority = .interactive,
-    } });
+    } }) catch {};
 }
 
 /// Check for cancel signals without blocking.
@@ -1074,14 +1112,22 @@ fn checkCancel(agent: *Agent) bool {
                 cancelled = true;
             },
             .request => |*req| {
-                _ = agent.runtime.deliverSignal(agent, .{ .request = .{
+                agent.runtime.deliverSignal(agent, .{ .request = .{
                     .id = req.id,
                     .text = req.text,
                     .priority = req.priority,
-                } });
+                } }) catch {};
                 req.text = null;
             },
-            else => {},
+            .tool_done => |*td| {
+                agent.runtime.deliverSignal(agent, .{ .tool_done = .{
+                    .syscall_id = td.syscall_id,
+                    .output = td.output,
+                    .ok = td.ok,
+                    .detached = td.detached,
+                } }) catch {};
+                td.output = &.{};
+            },
         }
     }
     return cancelled;

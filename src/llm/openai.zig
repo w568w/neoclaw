@@ -3,8 +3,7 @@ const llm = @import("mod.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ToolCallView = llm.ToolCallView;
-pub const ToolCallOwned = llm.ToolCallOwned;
+pub const ToolCall = llm.ToolCall;
 pub const MessageView = llm.MessageView;
 
 pub const ChatResponse = struct {
@@ -12,12 +11,12 @@ pub const ChatResponse = struct {
     content: []const u8,
     finish_reason: llm.FinishReason,
     /// Owned array + owned nested string buffers.
-    tool_calls: []ToolCallOwned,
+    tool_calls: []ToolCall,
 
     /// Releases all owned fields in this response.
     pub fn deinit(self: *ChatResponse, allocator: Allocator) void {
         allocator.free(self.content);
-        llm.freeToolCallsOwned(allocator, self.tool_calls);
+        llm.freeToolCalls(allocator, self.tool_calls);
         self.* = undefined;
     }
 };
@@ -261,7 +260,7 @@ pub const ChatStream = struct {
         errdefer self.allocator.free(content);
 
         const finish_reason = llm.finishReasonFromString(self.finish_reason_builder.items);
-        const tool_calls = try self.allocator.alloc(ToolCallOwned, self.tool_builders.items.len);
+        const tool_calls = try self.allocator.alloc(ToolCall, self.tool_builders.items.len);
         errdefer self.allocator.free(tool_calls);
 
         var filled: usize = 0;
@@ -422,7 +421,7 @@ fn parseChatResponse(allocator: Allocator, body: []const u8) !ChatResponse {
 
     const finish_reason = llm.finishReasonFromString(first.finish_reason orelse "");
     const raw_tool_calls = first.message.tool_calls orelse &.{};
-    const tool_calls = try allocator.alloc(ToolCallOwned, raw_tool_calls.len);
+    const tool_calls = try allocator.alloc(ToolCall, raw_tool_calls.len);
     errdefer allocator.free(tool_calls);
 
     var filled: usize = 0;
