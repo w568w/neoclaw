@@ -275,7 +275,7 @@ const Agent = struct {
     signal_cond: std.Io.Condition = .init,
 
     fn deinit(self: *Agent, allocator: Allocator) void {
-        llm.freeMessagesOwned(allocator, &self.history);
+        llm.MessageOwned.freeList(allocator, &self.history);
         for (self.signals.items) |*sig| sig.deinit(allocator);
         self.signals.deinit(allocator);
         self.* = undefined;
@@ -314,6 +314,330 @@ const Agent = struct {
         const id = self.next_syscall_id;
         self.next_syscall_id += 1;
         return id;
+    }
+
+    // -- Agent process main loop (= userspace execution) --
+
+    fn main(self: *Agent) std.Io.Cancelable!void {
+        const runtime = self.runtime;
+        const allocator = self.allocator;
+
+        while (true) {
+            var batch = self.waitSignals() orelse break;
+            defer {
+                for (batch.items) |*sig| sig.deinit(allocator);
+                batch.deinit(allocator);
+            }
+
+            var request: ?Request = null;
+            var hi_requests: std.ArrayList(Request) = .empty;
+            var lo_requests: std.ArrayList(Request) = .empty;
+            defer {
+                for (hi_requests.items) |*r| r.deinit(allocator);
+                hi_requests.deinit(allocator);
+                for (lo_requests.items) |*r| r.deinit(allocator);
+                lo_requests.deinit(allocator);
+            }
+            for (batch.items) |*sig| {
+                switch (sig.*) {
+                    .request => |req| {
+                        switch (req.priority) {
+                            .interactive => hi_requests.append(allocator, req) catch continue,
+                            .background => lo_requests.append(allocator, req) catch continue,
+                        }
+                        sig.* = .cancel; // Prevent double-free in batch defer.
+                    },
+                    .tool_done => |td| {
+                        if (td.detached) {
+                            _ = runtime.event_log.append(.{ .tool_completed = .{
+                                .agent_id = self.id,
+                                .syscall_id = td.syscall_id,
+                                .output = td.output,
+                                .ok = td.ok,
+                            } }) catch {};
+                            self.queueDetachedInterrupt(td);
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (hi_requests.items.len > 0) {
+                request = hi_requests.orderedRemove(0);
+            } else if (lo_requests.items.len > 0) {
+                request = lo_requests.orderedRemove(0);
+            }
+
+            if (request == null) continue;
+
+            // Put remaining requests back into signal queue (ownership transfer).
+            for (hi_requests.items) |*req| {
+                runtime.deliverSignal(self, .{ .request = .{
+                    .id = req.id,
+                    .text = req.text,
+                    .priority = req.priority,
+                } }) catch {};
+                req.text = null;
+            }
+            for (lo_requests.items) |*req| {
+                runtime.deliverSignal(self, .{ .request = .{
+                    .id = req.id,
+                    .text = req.text,
+                    .priority = req.priority,
+                } }) catch {};
+                req.text = null;
+            }
+
+            var req = request.?;
+            defer req.deinit(allocator);
+            self.processRequest(&req) catch |err| {
+                _ = runtime.event_log.append(.{ .fault = .{ .agent_id = self.id, .message = @errorName(err) } }) catch {};
+                _ = runtime.event_log.append(.{ .finished = .{ .agent_id = self.id, .request_id = req.id, .final_text = @errorName(err) } }) catch {};
+            };
+        }
+    }
+
+    /// Process a single request: call LLM in a loop, handle tool calls via syscalls.
+    fn processRequest(self: *Agent, request: *const Request) !void {
+        const runtime = self.runtime;
+        const allocator = self.allocator;
+
+        try self.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, request.text.?) });
+        _ = try runtime.event_log.append(.{ .started = .{ .agent_id = self.id, .request_id = request.id } });
+        debugLog("start_request agent={d} request={d}", .{ self.id, request.id });
+
+        var turn: u32 = 0;
+        while (turn < runtime.config.max_turns) : (turn += 1) {
+            if (self.checkCancel()) {
+                return self.finishRequest(request.id, "[CANCELED]");
+            }
+
+            const response = self.callLlm() catch |err| {
+                return self.finishRequest(request.id, @errorName(err));
+            };
+            defer {
+                var resp = response;
+                resp.deinit(allocator);
+            }
+
+            if (response.tool_calls.len == 0) {
+                const content = try allocator.dupe(u8, response.content);
+                errdefer allocator.free(content);
+                try self.history.append(allocator, .{ .role = .assistant, .content = content });
+                _ = try runtime.event_log.append(.{ .finished = .{ .agent_id = self.id, .request_id = request.id, .final_text = response.content } });
+                debugLog("finished agent={d} request={d}", .{ self.id, request.id });
+                return;
+            }
+
+            const assistant_calls = try llm.ToolCall.cloneSlice(allocator, response.tool_calls);
+            errdefer llm.ToolCall.freeSlice(allocator, assistant_calls);
+            try self.history.append(allocator, .{ .role = .assistant, .content = null, .tool_calls = assistant_calls });
+
+            for (response.tool_calls) |tc| {
+                if (self.checkCancel()) {
+                    return self.finishRequest(request.id, "[CANCELED]");
+                }
+                try self.executeSyscall(tc);
+            }
+        }
+
+        try self.finishRequest(request.id, "[MAX_TURNS_EXCEEDED]");
+    }
+
+    fn recordToolResult(self: *Agent, syscall_id: SyscallId, tc_id: []const u8, output: []const u8, ok: bool) !void {
+        const allocator = self.allocator;
+        try self.history.append(allocator, .{
+            .role = .tool,
+            .content = try allocator.dupe(u8, output),
+            .tool_call_id = try allocator.dupe(u8, tc_id),
+        });
+        _ = try self.runtime.event_log.append(.{ .tool_completed = .{
+            .agent_id = self.id,
+            .syscall_id = syscall_id,
+            .output = output,
+            .ok = ok,
+        } });
+    }
+
+    /// Issue a syscall for a single tool call and wait for the result.
+    fn executeSyscall(self: *Agent, tc: openai.ToolCall) !void {
+        const runtime = self.runtime;
+        const allocator = self.allocator;
+        const syscall_id = self.nextSyscallId();
+
+        _ = try runtime.event_log.append(.{ .tool_started = .{ .agent_id = self.id, .syscall_id = syscall_id, .name = tc.name } });
+
+        var start_result = runtime.kernel.start(tc.name, tc.arguments_json, allocator) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "tool `{s}` failed to start: {s}", .{ tc.name, @errorName(err) });
+            defer allocator.free(msg);
+            try self.recordToolResult(syscall_id, tc.id, msg, false);
+            return;
+        };
+
+        switch (start_result) {
+            .ready => |output| {
+                defer allocator.free(output);
+                try self.recordToolResult(syscall_id, tc.id, output, true);
+                start_result = undefined;
+            },
+            .wait => |wait| {
+                switch (wait) {
+                    .worker => |job| {
+                        _ = try runtime.event_log.append(.{ .tool_waiting = .{ .agent_id = self.id, .syscall_id = syscall_id } });
+                        runtime.spawnToolWorker(self.id, syscall_id, job, false);
+                        start_result = undefined;
+                    },
+                    .user => |user_wait| {
+                        _ = try runtime.event_log.append(.{ .waiting_user = .{ .agent_id = self.id, .syscall_id = syscall_id, .question = user_wait.question } });
+                        allocator.free(user_wait.question);
+                        start_result = undefined;
+                    },
+                }
+                const result = self.waitToolDone(syscall_id);
+                defer allocator.free(result.output);
+                try self.recordToolResult(syscall_id, tc.id, result.output, result.ok);
+            },
+            .detach => |det| {
+                _ = try runtime.event_log.append(.{ .tool_detached = .{ .agent_id = self.id, .syscall_id = syscall_id, .ack = det.ack } });
+                defer allocator.free(det.ack);
+                try self.recordToolResult(syscall_id, tc.id, det.ack, true);
+                runtime.spawnToolWorker(self.id, syscall_id, det.job, true);
+                start_result = undefined;
+            },
+        }
+    }
+
+    /// Wait for a tool_done signal matching the given syscall_id.
+    /// Detached completions for other syscalls are queued as pending interrupts.
+    fn waitToolDone(self: *Agent, target_syscall_id: SyscallId) struct { output: []const u8, ok: bool } {
+        const runtime = self.runtime;
+        const allocator = self.allocator;
+
+        while (true) {
+            var batch = self.waitSignals() orelse
+                return .{ .output = &.{}, .ok = false };
+            defer {
+                for (batch.items) |*sig| sig.deinit(allocator);
+                batch.deinit(allocator);
+            }
+
+            for (batch.items) |*sig| {
+                switch (sig.*) {
+                    .tool_done => |td| {
+                        if (td.syscall_id == target_syscall_id and !td.detached) {
+                            const output = allocator.dupe(u8, td.output) catch
+                                return .{ .output = &.{}, .ok = false };
+                            return .{ .output = output, .ok = td.ok };
+                        }
+                        if (td.detached) {
+                            _ = runtime.event_log.append(.{ .tool_completed = .{ .agent_id = self.id, .syscall_id = td.syscall_id, .output = td.output, .ok = td.ok } }) catch {};
+                            self.queueDetachedInterrupt(td);
+                        }
+                    },
+                    .cancel => {
+                        const output = allocator.dupe(u8, "[CANCELED]") catch
+                            return .{ .output = &.{}, .ok = false };
+                        return .{ .output = output, .ok = false };
+                    },
+                    .request => |*req| {
+                        runtime.deliverSignal(self, .{ .request = .{
+                            .id = req.id,
+                            .text = req.text,
+                            .priority = req.priority,
+                        } }) catch {};
+                        req.text = null;
+                    },
+                }
+            }
+        }
+    }
+
+    fn queueDetachedInterrupt(self: *Agent, td: @FieldType(Signal, "tool_done")) void {
+        const allocator = self.allocator;
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        out.writer.print("[DETACHED INTERRUPT] syscall {d} [{s}]\n{s}", .{
+            td.syscall_id,
+            if (td.ok) "ok" else "failed",
+            td.output,
+        }) catch return;
+
+        const text = out.toOwnedSlice() catch return;
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.runtime.deliverSignal(self, .{ .request = .{
+            .id = request_id,
+            .text = text,
+            .priority = .interactive,
+        } }) catch {};
+    }
+
+    /// Check for cancel signals without blocking.
+    fn checkCancel(self: *Agent) bool {
+        var batch = self.drainSignals();
+        defer {
+            for (batch.items) |*sig| sig.deinit(self.allocator);
+            batch.deinit(self.allocator);
+        }
+
+        var cancelled = false;
+        for (batch.items) |*sig| {
+            switch (sig.*) {
+                .cancel => {
+                    cancelled = true;
+                },
+                .request => |*req| {
+                    self.runtime.deliverSignal(self, .{ .request = .{
+                        .id = req.id,
+                        .text = req.text,
+                        .priority = req.priority,
+                    } }) catch {};
+                    req.text = null;
+                },
+                .tool_done => |*td| {
+                    self.runtime.deliverSignal(self, .{ .tool_done = .{
+                        .syscall_id = td.syscall_id,
+                        .output = td.output,
+                        .ok = td.ok,
+                        .detached = td.detached,
+                    } }) catch {};
+                    td.output = &.{};
+                },
+            }
+        }
+        return cancelled;
+    }
+
+    fn finishRequest(self: *Agent, request_id: RequestId, reason: []const u8) !void {
+        _ = try self.runtime.event_log.append(.{ .fault = .{ .agent_id = self.id, .message = reason } });
+        _ = try self.runtime.event_log.append(.{ .finished = .{ .agent_id = self.id, .request_id = request_id, .final_text = reason } });
+    }
+
+    /// Call LLM synchronously, streaming deltas as events.
+    fn callLlm(self: *Agent) !openai.ChatResponse {
+        const runtime = self.runtime;
+        const allocator = self.allocator;
+
+        var message_views: std.ArrayList(llm.MessageView) = .empty;
+        defer message_views.deinit(allocator);
+        try message_views.ensureUnusedCapacity(allocator, self.history.items.len);
+        for (self.history.items) |*msg| message_views.appendAssumeCapacity(msg.asView());
+
+        var stream = try runtime.client.chatStream(message_views.items, runtime.config.tools_json);
+        defer stream.deinit();
+        debugLog("llm_call agent={d}", .{self.id});
+
+        while (true) {
+            const event_opt = try stream.next();
+            if (event_opt) |event| switch (event) {
+                .content_delta => |delta| {
+                    _ = runtime.event_log.append(.{ .assistant_delta = .{ .agent_id = self.id, .text = delta } }) catch {};
+                },
+                .finished => {},
+            } else break;
+        }
+
+        return try stream.takeResponseOwned();
     }
 };
 
@@ -465,14 +789,16 @@ pub const EventLog = struct {
 };
 
 pub const Runtime = struct {
+    // -- Dependencies (injected, not owned) --
     allocator: Allocator,
     io: std.Io,
     client: *openai.Client,
     kernel: ToolKernel,
     config: RuntimeConfig,
 
-    /// Protects `inbox`, `agents`, `shutdown`, and `next_agent_id`.
-    /// Lock ordering: Runtime.mutex -> Agent.signal_mutex -> InboxItem.mutex.
+    // -- Kernel synchronization --
+    // Protects `inbox`, `agents`, `shutdown`, and `next_agent_id`.
+    // Lock ordering: Runtime.mutex -> Agent.signal_mutex -> InboxItem.mutex.
     mutex: std.Io.Mutex = .init,
     /// Signaled when a new item is enqueued to `inbox` or `shutdown` is set.
     inbox_cond: std.Io.Condition = .init,
@@ -480,6 +806,7 @@ pub const Runtime = struct {
     shutdown: bool = false,
     worker_group: std.Io.Group = .init,
 
+    // -- Agent registry and event log --
     agents: std.AutoArrayHashMapUnmanaged(AgentId, *Agent) = .empty,
     event_log: EventLog,
     inbox: std.DoublyLinkedList = .{},
@@ -646,18 +973,9 @@ pub const Runtime = struct {
         }
 
         const result: InboxItem.Result = switch (item.msg) {
-            .submit_query => |*msg| blk: {
-                const r = self.handleSubmitQuery(msg) catch |err|
-                    break :blk .{ .err = mapSubmitError(err) };
-                break :blk r;
-            },
-            .submit_reply => |*msg| blk: {
-                const r = self.handleSubmitReply(msg) catch |err|
-                    break :blk .{ .err = mapSubmitError(err) };
-                break :blk r;
-            },
-            .cancel_agent => |msg| self.handleCancelAgent(msg) catch |err|
-                .{ .cancel_err = mapCancelError(err) },
+            .submit_query => |*msg| self.handleSubmitQuery(msg),
+            .submit_reply => |*msg| self.handleSubmitReply(msg),
+            .cancel_agent => |msg| self.handleCancelAgent(msg),
             .tool_done => unreachable,
         };
         item.mutex.lockUncancelable(self.io);
@@ -667,37 +985,37 @@ pub const Runtime = struct {
         item.mutex.unlock(self.io);
     }
 
-    fn handleSubmitQuery(self: *Runtime, msg: *@FieldType(InboxItem.Msg, "submit_query")) !InboxItem.Result {
+    fn handleSubmitQuery(self: *Runtime, msg: *@FieldType(InboxItem.Msg, "submit_query")) InboxItem.Result {
         const agent = if (msg.agent_id) |id|
-            self.getAgent(id) orelse return error.UnknownAgent
+            self.getAgent(id) orelse return .{ .err = error.UnknownAgent }
         else
-            try self.createAgent();
+            self.createAgent() catch return .{ .err = error.OutOfMemory };
 
         const request_id = agent.next_request_id;
         agent.next_request_id += 1;
-        const accepted_seq = try self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .request_id = request_id } });
+        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .request_id = request_id } }) catch
+            return .{ .err = error.OutOfMemory };
         debugLog("submit_query agent={d} request={d}", .{ agent.id, request_id });
 
-        // Ownership of text transfers to signal (freed on delivery failure).
         self.deliverSignal(agent, .{ .request = .{
             .id = request_id,
             .text = msg.text.?,
             .priority = msg.priority,
         } }) catch {
             msg.text = null;
-            return error.OutOfMemory;
+            return .{ .err = error.OutOfMemory };
         };
         msg.text = null;
 
         return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = agent.id, .request_id = request_id } };
     }
 
-    fn handleSubmitReply(self: *Runtime, msg: *@FieldType(InboxItem.Msg, "submit_reply")) !InboxItem.Result {
-        const agent = self.getAgent(msg.agent_id) orelse return error.UnknownAgent;
-        const accepted_seq = try self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .request_id = null } });
+    fn handleSubmitReply(self: *Runtime, msg: *@FieldType(InboxItem.Msg, "submit_reply")) InboxItem.Result {
+        const agent = self.getAgent(msg.agent_id) orelse return .{ .err = error.UnknownAgent };
+        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .request_id = null } }) catch
+            return .{ .err = error.OutOfMemory };
         debugLog("submit_reply agent={d} syscall={d}", .{ msg.agent_id, msg.syscall_id });
 
-        // Ownership of text transfers to signal (freed on delivery failure).
         self.deliverSignal(agent, .{ .tool_done = .{
             .syscall_id = msg.syscall_id,
             .output = msg.text.?,
@@ -705,15 +1023,15 @@ pub const Runtime = struct {
             .detached = false,
         } }) catch {
             msg.text = null;
-            return error.OutOfMemory;
+            return .{ .err = error.OutOfMemory };
         };
         msg.text = null;
 
         return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = msg.agent_id, .request_id = null } };
     }
 
-    fn handleCancelAgent(self: *Runtime, msg: @FieldType(InboxItem.Msg, "cancel_agent")) !InboxItem.Result {
-        const agent = self.getAgent(msg.agent_id) orelse return error.UnknownAgent;
+    fn handleCancelAgent(self: *Runtime, msg: @FieldType(InboxItem.Msg, "cancel_agent")) InboxItem.Result {
+        const agent = self.getAgent(msg.agent_id) orelse return .{ .cancel_err = error.UnknownAgent };
         debugLog("cancel agent={d}", .{msg.agent_id});
 
         self.deliverSignal(agent, .cancel) catch {};
@@ -722,7 +1040,6 @@ pub const Runtime = struct {
     }
 
     /// Delivers tool_done to the agent. On success, ownership of msg.output is transferred.
-    /// On failure (unknown agent or OOM), returns false and output is freed.
     fn dispatchToolDone(self: *Runtime, msg: @FieldType(InboxItem.Msg, "tool_done")) bool {
         const agent = self.getAgent(msg.agent_id) orelse return false;
         self.deliverSignal(agent, .{ .tool_done = .{
@@ -768,8 +1085,7 @@ pub const Runtime = struct {
         defer self.mutex.unlock(self.io);
         try self.agents.put(self.allocator, agent.id, agent);
 
-        // Spawn the agent's process.
-        self.worker_group.concurrent(self.io, agentMain, .{agent}) catch |err| {
+        self.worker_group.concurrent(self.io, Agent.main, .{agent}) catch |err| {
             _ = self.agents.fetchSwapRemove(agent.id);
             return err;
         };
@@ -779,6 +1095,22 @@ pub const Runtime = struct {
     fn getAgent(self: *Runtime, agent_id: AgentId) ?*Agent {
         return self.agents.get(agent_id);
     }
+
+    // -- Tool workers (= kernel threads for executing syscalls) --
+
+    const ToolWorkerCtx = struct {
+        runtime: *Runtime,
+        allocator: Allocator,
+        agent_id: AgentId,
+        syscall_id: SyscallId,
+        job: ToolJob,
+        detached: bool,
+
+        fn deinit(self: *ToolWorkerCtx) void {
+            self.job.deinit(self.allocator);
+            self.allocator.destroy(self);
+        }
+    };
 
     fn spawnToolWorker(self: *Runtime, agent_id: AgentId, syscall_id: SyscallId, job: ToolJob, detached: bool) void {
         debugLog("spawn_tool_worker agent={d} syscall={d} detached={}", .{ agent_id, syscall_id, detached });
@@ -802,10 +1134,47 @@ pub const Runtime = struct {
         };
     }
 
+    fn toolWorkerMain(ctx: *ToolWorkerCtx) std.Io.Cancelable!void {
+        defer ctx.deinit();
+
+        var ok = true;
+        debugLog("tool_worker_main agent={d} syscall={d}", .{ ctx.agent_id, ctx.syscall_id });
+        const output = ctx.job.run(ctx.allocator) catch |err| blk: {
+            ok = false;
+            break :blk std.fmt.allocPrint(ctx.allocator, "tool worker failed: {s}", .{@errorName(err)}) catch return;
+        };
+
+        ctx.runtime.enqueueToolDone(.{
+            .agent_id = ctx.agent_id,
+            .syscall_id = ctx.syscall_id,
+            .output = output,
+            .ok = ok,
+            .detached = ctx.detached,
+        });
+    }
+
+    fn enqueueToolDone(self: *Runtime, msg: @FieldType(InboxItem.Msg, "tool_done")) void {
+        const item = self.allocator.create(InboxItem) catch {
+            if (msg.output) |o| self.allocator.free(o);
+            return;
+        };
+        item.* = .{ .msg = .{ .tool_done = msg } };
+
+        self.mutex.lockUncancelable(self.io);
+        if (self.shutdown) {
+            self.mutex.unlock(self.io);
+            item.deinit(self.allocator);
+            self.allocator.destroy(item);
+            return;
+        }
+        self.inbox.append(&item.node);
+        self.inbox_cond.signal(self.io);
+        self.mutex.unlock(self.io);
+    }
+
     fn sendToolFailure(self: *Runtime, agent_id: AgentId, syscall_id: SyscallId, detached: bool) void {
         const agent = self.getAgent(agent_id) orelse return;
         const output = self.allocator.dupe(u8, "[tool worker failed to spawn]") catch {
-            // Extreme OOM: deliver signal with empty output.
             self.deliverSignal(agent, .{ .tool_done = .{
                 .syscall_id = syscall_id,
                 .output = &.{},
@@ -821,417 +1190,4 @@ pub const Runtime = struct {
             .detached = detached,
         } }) catch {};
     }
-
 };
-
-// 5. Agent process main loop (= userspace execution).
-//
-// Each agent runs in its own concurrent context. It waits for request signals,
-// then processes them by calling LLM and issuing syscalls for tools.
-
-fn agentMain(agent: *Agent) std.Io.Cancelable!void {
-    const runtime = agent.runtime;
-    const allocator = agent.allocator;
-
-    while (true) {
-        // Wait for a request signal. null = shutdown.
-        var batch = agent.waitSignals() orelse break;
-        defer {
-            for (batch.items) |*sig| sig.deinit(allocator);
-            batch.deinit(allocator);
-        }
-
-        // Find the highest-priority request (interactive before background).
-        var request: ?Request = null;
-        var hi_requests: std.ArrayList(Request) = .empty;
-        var lo_requests: std.ArrayList(Request) = .empty;
-        defer {
-            for (hi_requests.items) |*r| r.deinit(allocator);
-            hi_requests.deinit(allocator);
-            for (lo_requests.items) |*r| r.deinit(allocator);
-            lo_requests.deinit(allocator);
-        }
-        for (batch.items) |*sig| {
-            switch (sig.*) {
-                .request => |req| {
-                    switch (req.priority) {
-                        .interactive => hi_requests.append(allocator, req) catch continue,
-                        .background => lo_requests.append(allocator, req) catch continue,
-                    }
-                    sig.* = .cancel; // Prevent double-free in batch defer.
-                },
-                .tool_done => |td| {
-                    if (td.detached) {
-                        _ = runtime.event_log.append(.{ .tool_completed = .{
-                            .agent_id = agent.id,
-                            .syscall_id = td.syscall_id,
-                            .output = td.output,
-                            .ok = td.ok,
-                        } }) catch {};
-                        queueDetachedInterrupt(agent, td);
-                    }
-                },
-                else => {},
-            }
-        }
-
-        // Pick first interactive, then first background.
-        if (hi_requests.items.len > 0) {
-            request = hi_requests.orderedRemove(0);
-        } else if (lo_requests.items.len > 0) {
-            request = lo_requests.orderedRemove(0);
-        }
-
-        if (request == null) {
-            continue;
-        }
-
-        // Put remaining requests back into signal queue for later (ownership transfer).
-        for (hi_requests.items) |*req| {
-            runtime.deliverSignal(agent, .{ .request = .{
-                .id = req.id,
-                .text = req.text,
-                .priority = req.priority,
-            } }) catch {};
-            req.text = null;
-        }
-        for (lo_requests.items) |*req| {
-            runtime.deliverSignal(agent, .{ .request = .{
-                .id = req.id,
-                .text = req.text,
-                .priority = req.priority,
-            } }) catch {};
-            req.text = null;
-        }
-
-        var req = request.?;
-        defer req.deinit(allocator);
-        processRequest(agent, &req) catch |err| {
-            _ = runtime.event_log.append(.{ .fault = .{ .agent_id = agent.id, .message = @errorName(err) } }) catch {};
-            _ = runtime.event_log.append(.{ .finished = .{ .agent_id = agent.id, .request_id = req.id, .final_text = @errorName(err) } }) catch {};
-        };
-    }
-}
-
-/// Process a single request: call LLM in a loop, handle tool calls via syscalls.
-fn processRequest(agent: *Agent, request: *const Request) !void {
-    const runtime = agent.runtime;
-    const allocator = agent.allocator;
-
-    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, request.text.?) });
-    _ = try runtime.event_log.append(.{ .started = .{ .agent_id = agent.id, .request_id = request.id } });
-    debugLog("start_request agent={d} request={d}", .{ agent.id, request.id });
-
-    var turn: u32 = 0;
-    while (turn < runtime.config.max_turns) : (turn += 1) {
-        // Check for cancel before LLM call.
-        if (checkCancel(agent)) {
-            return finishRequest(agent, request.id, "[CANCELED]");
-        }
-
-        // Call LLM (synchronous in this agent's concurrent context).
-        const response = callLlm(agent) catch |err| {
-            return finishRequest(agent, request.id, @errorName(err));
-        };
-        defer {
-            var resp = response;
-            resp.deinit(allocator);
-        }
-
-        // No tool calls → finished.
-        if (response.tool_calls.len == 0) {
-            const content = try allocator.dupe(u8, response.content);
-            errdefer allocator.free(content);
-            try agent.history.append(allocator, .{ .role = .assistant, .content = content });
-            _ = try runtime.event_log.append(.{ .finished = .{ .agent_id = agent.id, .request_id = request.id, .final_text = response.content } });
-            debugLog("finished agent={d} request={d}", .{ agent.id, request.id });
-            return;
-        }
-
-        // Record assistant message with tool calls in history.
-        const assistant_calls = try llm.cloneToolCalls(allocator, response.tool_calls);
-        errdefer llm.freeToolCalls(allocator, assistant_calls);
-        try agent.history.append(allocator, .{ .role = .assistant, .content = null, .tool_calls = assistant_calls });
-
-        // Execute each tool call (syscall).
-        for (response.tool_calls) |tc| {
-            if (checkCancel(agent)) {
-                return finishRequest(agent, request.id, "[CANCELED]");
-            }
-            try executeSyscall(agent, request.id, tc);
-        }
-    }
-
-    // Max turns exceeded.
-    try finishRequest(agent, request.id, "[MAX_TURNS_EXCEEDED]");
-}
-
-fn recordToolResult(agent: *Agent, syscall_id: SyscallId, tc_id: []const u8, output: []const u8, ok: bool) !void {
-    const allocator = agent.allocator;
-    try agent.history.append(allocator, .{
-        .role = .tool,
-        .content = try allocator.dupe(u8, output),
-        .tool_call_id = try allocator.dupe(u8, tc_id),
-    });
-    _ = try agent.runtime.event_log.append(.{ .tool_completed = .{
-        .agent_id = agent.id,
-        .syscall_id = syscall_id,
-        .output = output,
-        .ok = ok,
-    } });
-}
-
-/// Issue a syscall for a single tool call and wait for the result.
-fn executeSyscall(agent: *Agent, request_id: RequestId, tc: openai.ToolCall) !void {
-    const runtime = agent.runtime;
-    const allocator = agent.allocator;
-    const syscall_id = agent.nextSyscallId();
-
-    _ = try runtime.event_log.append(.{ .tool_started = .{ .agent_id = agent.id, .syscall_id = syscall_id, .name = tc.name } });
-
-    var start_result = runtime.kernel.start(tc.name, tc.arguments_json, allocator) catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "tool `{s}` failed to start: {s}", .{ tc.name, @errorName(err) });
-        defer allocator.free(msg);
-        try recordToolResult(agent, syscall_id, tc.id, msg, false);
-        return;
-    };
-
-    switch (start_result) {
-        .ready => |output| {
-            defer allocator.free(output);
-            try recordToolResult(agent, syscall_id, tc.id, output, true);
-            start_result = undefined;
-        },
-        .wait => |wait| {
-            switch (wait) {
-                .worker => |job| {
-                    _ = try runtime.event_log.append(.{ .tool_waiting = .{ .agent_id = agent.id, .syscall_id = syscall_id } });
-                    runtime.spawnToolWorker(agent.id, syscall_id, job, false);
-                    start_result = undefined;
-                },
-                .user => |user_wait| {
-                    _ = try runtime.event_log.append(.{ .waiting_user = .{ .agent_id = agent.id, .syscall_id = syscall_id, .question = user_wait.question } });
-                    allocator.free(user_wait.question);
-                    start_result = undefined;
-                },
-            }
-            const result = waitToolDone(agent, syscall_id, request_id);
-            defer allocator.free(result.output);
-            try recordToolResult(agent, syscall_id, tc.id, result.output, result.ok);
-        },
-        .detach => |det| {
-            _ = try runtime.event_log.append(.{ .tool_detached = .{ .agent_id = agent.id, .syscall_id = syscall_id, .ack = det.ack } });
-            defer allocator.free(det.ack);
-            try recordToolResult(agent, syscall_id, tc.id, det.ack, true);
-            runtime.spawnToolWorker(agent.id, syscall_id, det.job, true);
-            start_result = undefined;
-        },
-    }
-}
-
-/// Wait for a tool_done signal matching the given syscall_id.
-/// Detached completions for other syscalls are queued as pending interrupts.
-fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: RequestId) struct { output: []const u8, ok: bool } {
-    const runtime = agent.runtime;
-    const allocator = agent.allocator;
-    _ = request_id;
-
-    while (true) {
-        var batch = agent.waitSignals() orelse
-            return .{ .output = &.{}, .ok = false };
-        defer {
-            for (batch.items) |*sig| sig.deinit(allocator);
-            batch.deinit(allocator);
-        }
-
-        for (batch.items) |*sig| {
-            switch (sig.*) {
-                .tool_done => |td| {
-                    if (td.syscall_id == target_syscall_id and !td.detached) {
-                        const output = allocator.dupe(u8, td.output) catch
-                            return .{ .output = &.{}, .ok = false };
-                        return .{ .output = output, .ok = td.ok };
-                    }
-                    // Detached completion for another syscall: emit event + re-queue as request.
-                    if (td.detached) {
-                        _ = runtime.event_log.append(.{ .tool_completed = .{ .agent_id = agent.id, .syscall_id = td.syscall_id, .output = td.output, .ok = td.ok } }) catch {};
-                        queueDetachedInterrupt(agent, td);
-                    }
-                },
-                .cancel => {
-                    const output = allocator.dupe(u8, "[CANCELED]") catch
-                        return .{ .output = &.{}, .ok = false };
-                    return .{ .output = output, .ok = false };
-                },
-                .request => |*req| {
-                    // Re-queue requests that arrive while waiting (ownership transfer).
-                    runtime.deliverSignal(agent, .{ .request = .{
-                        .id = req.id,
-                        .text = req.text,
-                        .priority = req.priority,
-                    } }) catch {};
-                    req.text = null;
-                },
-            }
-        }
-    }
-}
-
-fn queueDetachedInterrupt(agent: *Agent, td: @FieldType(Signal, "tool_done")) void {
-    const allocator = agent.allocator;
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    out.writer.print("[DETACHED INTERRUPT] syscall {d} [{s}]\n{s}", .{
-        td.syscall_id,
-        if (td.ok) "ok" else "failed",
-        td.output,
-    }) catch return;
-
-    const text = out.toOwnedSlice() catch return;
-    const request_id = agent.next_request_id;
-    agent.next_request_id += 1;
-    agent.runtime.deliverSignal(agent, .{ .request = .{
-        .id = request_id,
-        .text = text,
-        .priority = .interactive,
-    } }) catch {};
-}
-
-/// Check for cancel signals without blocking.
-fn checkCancel(agent: *Agent) bool {
-    var batch = agent.drainSignals();
-    defer {
-        for (batch.items) |*sig| sig.deinit(agent.allocator);
-        batch.deinit(agent.allocator);
-    }
-
-    var cancelled = false;
-    for (batch.items) |*sig| {
-        switch (sig.*) {
-            .cancel => {
-                cancelled = true;
-            },
-            .request => |*req| {
-                agent.runtime.deliverSignal(agent, .{ .request = .{
-                    .id = req.id,
-                    .text = req.text,
-                    .priority = req.priority,
-                } }) catch {};
-                req.text = null;
-            },
-            .tool_done => |*td| {
-                agent.runtime.deliverSignal(agent, .{ .tool_done = .{
-                    .syscall_id = td.syscall_id,
-                    .output = td.output,
-                    .ok = td.ok,
-                    .detached = td.detached,
-                } }) catch {};
-                td.output = &.{};
-            },
-        }
-    }
-    return cancelled;
-}
-
-fn finishRequest(agent: *Agent, request_id: RequestId, reason: []const u8) !void {
-    _ = try agent.runtime.event_log.append(.{ .fault = .{ .agent_id = agent.id, .message = reason } });
-    _ = try agent.runtime.event_log.append(.{ .finished = .{ .agent_id = agent.id, .request_id = request_id, .final_text = reason } });
-}
-
-/// Call LLM synchronously, streaming deltas as events.
-fn callLlm(agent: *Agent) !openai.ChatResponse {
-    const runtime = agent.runtime;
-    const allocator = agent.allocator;
-
-    var message_views: std.ArrayList(llm.MessageView) = .empty;
-    defer message_views.deinit(allocator);
-    try message_views.ensureUnusedCapacity(allocator, agent.history.items.len);
-    for (agent.history.items) |*msg| message_views.appendAssumeCapacity(msg.asView());
-
-    var stream = try runtime.client.chatStream(message_views.items, runtime.config.tools_json);
-    defer stream.deinit();
-    debugLog("llm_call agent={d}", .{agent.id});
-
-    while (true) {
-        const event_opt = try stream.next();
-        if (event_opt) |event| switch (event) {
-            .content_delta => |delta| {
-                _ = runtime.event_log.append(.{ .assistant_delta = .{ .agent_id = agent.id, .text = delta } }) catch {};
-            },
-            .finished => {},
-        } else break;
-    }
-
-    return try stream.takeResponseOwned();
-}
-
-// 6. Tool worker (= kernel thread for executing syscalls).
-
-const ToolWorkerCtx = struct {
-    runtime: *Runtime,
-    allocator: Allocator,
-    agent_id: AgentId,
-    syscall_id: SyscallId,
-    job: ToolJob,
-    detached: bool,
-
-    fn deinit(self: *ToolWorkerCtx) void {
-        self.job.deinit(self.allocator);
-        self.allocator.destroy(self);
-    }
-};
-
-fn toolWorkerMain(ctx: *ToolWorkerCtx) std.Io.Cancelable!void {
-    defer ctx.deinit();
-
-    var ok = true;
-    debugLog("tool_worker_main agent={d} syscall={d}", .{ ctx.agent_id, ctx.syscall_id });
-    const output = ctx.job.run(ctx.allocator) catch |err| blk: {
-        ok = false;
-        break :blk std.fmt.allocPrint(ctx.allocator, "tool worker failed: {s}", .{@errorName(err)}) catch return;
-    };
-
-    enqueueToolDone(ctx.runtime, ctx.allocator, .{
-        .agent_id = ctx.agent_id,
-        .syscall_id = ctx.syscall_id,
-        .output = output,
-        .ok = ok,
-        .detached = ctx.detached,
-    });
-}
-
-fn enqueueToolDone(runtime: *Runtime, allocator: Allocator, msg: @FieldType(InboxItem.Msg, "tool_done")) void {
-    const item = allocator.create(InboxItem) catch {
-        if (msg.output) |o| allocator.free(o);
-        return;
-    };
-    item.* = .{ .msg = .{ .tool_done = msg } };
-
-    runtime.mutex.lockUncancelable(runtime.io);
-    if (runtime.shutdown) {
-        runtime.mutex.unlock(runtime.io);
-        item.deinit(allocator);
-        allocator.destroy(item);
-        return;
-    }
-    runtime.inbox.append(&item.node);
-    runtime.inbox_cond.signal(runtime.io);
-    runtime.mutex.unlock(runtime.io);
-}
-
-fn mapSubmitError(err: anyerror) SubmitError {
-    return switch (err) {
-        error.RuntimeShutdown => error.RuntimeShutdown,
-        error.UnknownAgent => error.UnknownAgent,
-        error.AgentNotWaitingUser => error.AgentNotWaitingUser,
-        else => error.OutOfMemory,
-    };
-}
-
-fn mapCancelError(err: anyerror) CancelError {
-    return switch (err) {
-        error.RuntimeShutdown => error.RuntimeShutdown,
-        error.UnknownAgent => error.UnknownAgent,
-        else => error.OutOfMemory,
-    };
-}
