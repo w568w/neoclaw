@@ -73,7 +73,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) break;
 
         if (std.mem.eql(u8, trimmed, "/clear")) {
+            if (current_agent_id) |aid| _ = runtime.cancelAgent(aid) catch {};
             current_agent_id = null;
+            sub = runtime.event_log.subscribe(.tail);
             try stdout.writeAll("[history cleared]\n\n");
             continue;
         }
