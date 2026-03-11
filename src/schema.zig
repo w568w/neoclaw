@@ -17,14 +17,14 @@ pub fn Registry(comptime tools: anytype) type {
             return .{ .ctx = ctx };
         }
 
-        pub fn handler(self: *Self) loop.ToolHandler {
+        pub fn kernel(self: *Self) loop.ToolKernel {
             return .{
                 .ctx = self,
-                .dispatchFn = dispatchThunk,
+                .startFn = startThunk,
             };
         }
 
-        /// Returns owned JSON string for OpenAI `tools` field.
+        /// Returns an owned JSON blob suitable for the LLM API `tools` field.
         pub fn toolsJsonOwned(_: *Self, allocator: Allocator) ![]const u8 {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
@@ -39,21 +39,25 @@ pub fn Registry(comptime tools: anytype) type {
             return out.toOwnedSlice();
         }
 
-        fn dispatchThunk(ptr: *anyopaque, tool_name: []const u8, args_json: []const u8, allocator: Allocator) !loop.StepOutcome {
+        /// Returns a syscall start result whose owned payload, if any, is
+        /// transferred to the runtime.
+        fn startThunk(ptr: *anyopaque, tool_name: []const u8, args_json: []const u8, allocator: Allocator) !loop.ToolStartResult {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return self.dispatch(tool_name, args_json, allocator);
+            return self.start(tool_name, args_json, allocator);
         }
 
-        fn dispatch(self: *Self, tool_name: []const u8, args_json: []const u8, allocator: Allocator) !loop.StepOutcome {
+        /// Parses tool arguments and starts the tool. Any owned strings or jobs
+        /// stored in the returned value are now owned by the runtime.
+        fn start(self: *Self, tool_name: []const u8, args_json: []const u8, allocator: Allocator) !loop.ToolStartResult {
             inline for (tools) |tool| {
                 if (std.mem.eql(u8, tool_name, tool.name)) {
                     const parsed = try std.json.parseFromSlice(tool.Params, allocator, args_json, .{ .ignore_unknown_fields = true });
                     defer parsed.deinit();
-                    return tool.run(self.ctx, parsed.value, allocator);
+                    return tool.start(self.ctx, parsed.value, allocator);
                 }
             }
             const msg = try std.fmt.allocPrint(allocator, "unknown tool: {s}", .{tool_name});
-            return .{ .data = msg, .should_exit = false };
+            return .{ .ready = msg };
         }
     };
 }
@@ -84,9 +88,7 @@ fn writeParamsSchema(writer: *std.Io.Writer, comptime Params: type) !void {
 
     var required_count: usize = 0;
     inline for (fields) |f| {
-        if (!isOptionalType(f.type) and f.default_value_ptr == null) {
-            required_count += 1;
-        }
+        if (!isOptionalType(f.type) and f.default_value_ptr == null) required_count += 1;
     }
 
     if (required_count > 0) {

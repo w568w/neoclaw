@@ -9,8 +9,6 @@ pub const Params = struct {
     question: []const u8,
 };
 
-/// Returns owned `StepOutcome.data`.
-pub fn run(_: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.StepOutcome {
-    const payload = try std.fmt.allocPrint(allocator, "[ASK_USER] {s}", .{params.question});
-    return .{ .data = payload, .should_exit = true };
+pub fn start(_: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.ToolStartResult {
+    return .{ .wait = .{ .user = .{ .question = try allocator.dupe(u8, params.question) } } };
 }

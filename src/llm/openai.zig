@@ -1,46 +1,23 @@
 const std = @import("std");
+const llm = @import("mod.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ToolCall = struct {
-    /// Borrowed view.
-    id: []const u8,
-    /// Borrowed view.
-    name: []const u8,
-    /// Borrowed view.
-    arguments_json: []const u8,
-};
-
-pub const Message = struct {
-    role: Role,
-    /// Borrowed view. `Message` never frees this.
-    content: ?[]const u8 = null,
-    /// Borrowed view. `Message` never frees this.
-    tool_call_id: ?[]const u8 = null,
-    /// Borrowed view. `Message` never frees this.
-    tool_calls: ?[]const ToolCall = null,
-
-    pub const Role = enum {
-        system,
-        user,
-        assistant,
-        tool,
-    };
-};
+pub const ToolCallView = llm.ToolCallView;
+pub const ToolCallOwned = llm.ToolCallOwned;
+pub const MessageView = llm.MessageView;
 
 pub const ChatResponse = struct {
     /// Owned buffer.
     content: []const u8,
-    /// Owned buffer.
-    finish_reason: []const u8,
+    finish_reason: llm.FinishReason,
     /// Owned array + owned nested string buffers.
-    tool_calls: []ToolCall,
+    tool_calls: []ToolCallOwned,
 
     /// Releases all owned fields in this response.
     pub fn deinit(self: *ChatResponse, allocator: Allocator) void {
         allocator.free(self.content);
-        allocator.free(self.finish_reason);
-        freeToolCalls(allocator, self.tool_calls);
+        llm.freeToolCallsOwned(allocator, self.tool_calls);
         self.* = undefined;
     }
 };
@@ -93,7 +70,7 @@ pub const Client = struct {
     }
 
     /// Returns owned `ChatResponse`. Caller must call `ChatResponse.deinit`.
-    pub fn chat(self: *Client, messages: []const Message, tools_json: ?[]const u8) !ChatResponse {
+    pub fn chat(self: *Client, messages: []const MessageView, tools_json: ?[]const u8) !ChatResponse {
         const endpoint = try self.chatCompletionsEndpoint();
         defer self.allocator.free(endpoint);
 
@@ -121,12 +98,11 @@ pub const Client = struct {
         });
 
         if (result.status != .ok) return Error.HttpStatusNotOk;
-
         return parseChatResponse(self.allocator, response_body_writer.written());
     }
 
     /// Returns an owned stream object. Caller must call `ChatStream.deinit`.
-    pub fn chatStream(self: *Client, messages: []const Message, tools_json: ?[]const u8) !ChatStream {
+    pub fn chatStream(self: *Client, messages: []const MessageView, tools_json: ?[]const u8) !ChatStream {
         const endpoint = try self.chatCompletionsEndpoint();
         defer self.allocator.free(endpoint);
 
@@ -143,9 +119,7 @@ pub const Client = struct {
         };
 
         const uri = try std.Uri.parse(endpoint);
-        var req = try self.http_client.request(.POST, uri, .{
-            .extra_headers = &headers,
-        });
+        var req = try self.http_client.request(.POST, uri, .{ .extra_headers = &headers });
         errdefer req.deinit();
 
         const payload = request_body_writer.written();
@@ -167,7 +141,7 @@ pub const Client = struct {
         return stream;
     }
 
-    fn writeChatRequestBody(self: *Client, writer: *std.Io.Writer, messages: []const Message, tools_json: ?[]const u8, stream: bool) !void {
+    fn writeChatRequestBody(self: *Client, writer: *std.Io.Writer, messages: []const MessageView, tools_json: ?[]const u8, stream: bool) !void {
         try writer.writeAll("{");
         try writer.print("\"model\":{f}", .{std.json.fmt(self.model, .{})});
         try writer.writeAll(",\"messages\":[");
@@ -181,20 +155,14 @@ pub const Client = struct {
                 try writer.print(",\"tools\":{s},\"tool_choice\":\"auto\"", .{t});
             }
         }
-        if (stream) {
-            try writer.writeAll(",\"stream\":true");
-        }
+        if (stream) try writer.writeAll(",\"stream\":true");
         try writer.writeAll("}");
     }
 
     /// Returns owned endpoint string.
     fn chatCompletionsEndpoint(self: *Client) ![]const u8 {
-        if (std.mem.endsWith(u8, self.api_base, "/chat/completions")) {
-            return self.allocator.dupe(u8, self.api_base);
-        }
-        if (std.mem.endsWith(u8, self.api_base, "/v1")) {
-            return std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.api_base});
-        }
+        if (std.mem.endsWith(u8, self.api_base, "/chat/completions")) return self.allocator.dupe(u8, self.api_base);
+        if (std.mem.endsWith(u8, self.api_base, "/v1")) return std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.api_base});
         return std.fmt.allocPrint(self.allocator, "{s}/v1/chat/completions", .{self.api_base});
     }
 };
@@ -274,9 +242,7 @@ pub const ChatStream = struct {
                 continue;
             }
 
-            if (try self.consumeChunk(payload)) |delta| {
-                return .{ .content_delta = delta };
-            }
+            if (try self.consumeChunk(payload)) |delta| return .{ .content_delta = delta };
         }
     }
 
@@ -289,10 +255,8 @@ pub const ChatStream = struct {
         const content = try self.content_builder.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(content);
 
-        const finish_reason = try self.finish_reason_builder.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(finish_reason);
-
-        const tool_calls = try self.allocator.alloc(ToolCall, self.tool_builders.items.len);
+        const finish_reason = llm.finishReasonFromString(self.finish_reason_builder.items);
+        const tool_calls = try self.allocator.alloc(ToolCallOwned, self.tool_builders.items.len);
         errdefer self.allocator.free(tool_calls);
 
         var filled: usize = 0;
@@ -314,11 +278,7 @@ pub const ChatStream = struct {
             filled = i + 1;
         }
 
-        return .{
-            .content = content,
-            .finish_reason = finish_reason,
-            .tool_calls = tool_calls,
-        };
+        return .{ .content = content, .finish_reason = finish_reason, .tool_calls = tool_calls };
     }
 
     /// Returns borrowed content delta valid until next stream read, if present.
@@ -365,17 +325,11 @@ pub const ChatStream = struct {
                     try self.ensureToolBuilder(delta_tool.index);
                     const tb = &self.tool_builders.items[delta_tool.index];
 
-                    if (delta_tool.id) |id| {
-                        try tb.id.appendSlice(self.allocator, id);
-                    }
+                    if (delta_tool.id) |id| try tb.id.appendSlice(self.allocator, id);
 
                     if (delta_tool.function) |fn_delta| {
-                        if (fn_delta.name) |name| {
-                            try tb.name.appendSlice(self.allocator, name);
-                        }
-                        if (fn_delta.arguments) |arguments| {
-                            try tb.arguments_json.appendSlice(self.allocator, arguments);
-                        }
+                        if (fn_delta.name) |name| try tb.name.appendSlice(self.allocator, name);
+                        if (fn_delta.arguments) |arguments| try tb.arguments_json.appendSlice(self.allocator, arguments);
                     }
                 }
             }
@@ -397,7 +351,7 @@ pub const ChatStream = struct {
     }
 };
 
-fn writeMessage(writer: *std.Io.Writer, msg: Message) !void {
+fn writeMessage(writer: *std.Io.Writer, msg: MessageView) !void {
     try writer.writeAll("{");
     try writer.print("\"role\":{f}", .{std.json.fmt(@tagName(msg.role), .{})});
 
@@ -427,42 +381,6 @@ fn writeMessage(writer: *std.Io.Writer, msg: Message) !void {
     }
 
     try writer.writeAll("}");
-}
-
-/// Returns owned array and owned nested strings. Caller must free via `freeToolCalls`.
-pub fn duplicateToolCalls(allocator: Allocator, src: []const ToolCall) ![]ToolCall {
-    const dst = try allocator.alloc(ToolCall, src.len);
-    errdefer allocator.free(dst);
-
-    var filled: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < filled) : (i += 1) {
-            allocator.free(dst[i].id);
-            allocator.free(dst[i].name);
-            allocator.free(dst[i].arguments_json);
-        }
-    }
-
-    for (src, 0..) |s, i| {
-        dst[i] = .{
-            .id = try allocator.dupe(u8, s.id),
-            .name = try allocator.dupe(u8, s.name),
-            .arguments_json = try allocator.dupe(u8, s.arguments_json),
-        };
-        filled = i + 1;
-    }
-    return dst;
-}
-
-/// Frees an array previously returned by `duplicateToolCalls` or equivalent owned array.
-pub fn freeToolCalls(allocator: Allocator, tool_calls: []const ToolCall) void {
-    for (tool_calls) |tc| {
-        allocator.free(tc.id);
-        allocator.free(tc.name);
-        allocator.free(tc.arguments_json);
-    }
-    allocator.free(tool_calls);
 }
 
 /// Returns owned `ChatResponse`. Caller must call `ChatResponse.deinit`.
@@ -496,11 +414,9 @@ fn parseChatResponse(allocator: Allocator, body: []const u8) !ChatResponse {
     const content = try allocator.dupe(u8, first.message.content orelse "");
     errdefer allocator.free(content);
 
-    const finish_reason = try allocator.dupe(u8, first.finish_reason orelse "");
-    errdefer allocator.free(finish_reason);
-
+    const finish_reason = llm.finishReasonFromString(first.finish_reason orelse "");
     const raw_tool_calls = first.message.tool_calls orelse &.{};
-    const tool_calls = try allocator.alloc(ToolCall, raw_tool_calls.len);
+    const tool_calls = try allocator.alloc(ToolCallOwned, raw_tool_calls.len);
     errdefer allocator.free(tool_calls);
 
     var filled: usize = 0;
@@ -522,9 +438,5 @@ fn parseChatResponse(allocator: Allocator, body: []const u8) !ChatResponse {
         filled = i + 1;
     }
 
-    return .{
-        .content = content,
-        .finish_reason = finish_reason,
-        .tool_calls = tool_calls,
-    };
+    return .{ .content = content, .finish_reason = finish_reason, .tool_calls = tool_calls };
 }

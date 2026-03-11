@@ -11,8 +11,7 @@ pub const Params = struct {
     count: usize = 200,
 };
 
-/// Returns owned `StepOutcome.data`.
-pub fn run(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.StepOutcome {
+pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.ToolStartResult {
     const safe_start = if (params.start == 0) @as(usize, 1) else params.start;
     const safe_count = if (params.count == 0) @as(usize, 1) else params.count;
 
@@ -43,5 +42,5 @@ pub fn run(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocato
         try out.writer.writeAll("(no content in requested range)\n");
     }
 
-    return .{ .data = try out.toOwnedSlice(), .should_exit = false };
+    return .{ .ready = try out.toOwnedSlice() };
 }

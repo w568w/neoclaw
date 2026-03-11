@@ -11,8 +11,7 @@ pub const Params = struct {
     mode: enum { overwrite, append } = .overwrite,
 };
 
-/// Returns owned `StepOutcome.data`.
-pub fn run(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.StepOutcome {
+pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.ToolStartResult {
     switch (params.mode) {
         .overwrite => {
             try std.Io.Dir.cwd().writeFile(ctx.io, .{
@@ -39,6 +38,5 @@ pub fn run(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocato
         },
     }
 
-    const msg = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ params.content.len, params.path });
-    return .{ .data = msg, .should_exit = false };
+    return .{ .ready = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ params.content.len, params.path }) };
 }

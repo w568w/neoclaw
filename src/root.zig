@@ -2,6 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+pub const llm = @import("llm/mod.zig");
 pub const openai = @import("llm/openai.zig");
 pub const loop = @import("loop.zig");
 pub const schema = @import("schema.zig");
