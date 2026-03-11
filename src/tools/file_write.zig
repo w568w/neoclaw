@@ -22,17 +22,20 @@ pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Alloca
         },
         .append => {
             const existing = std.Io.Dir.cwd().readFileAlloc(ctx.io, params.path, allocator, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
-                error.FileNotFound => try allocator.dupe(u8, ""),
+                error.FileNotFound => null,
                 else => return err,
             };
-            defer allocator.free(existing);
+            defer if (existing) |e| allocator.free(e);
 
-            const merged = try std.mem.concat(allocator, u8, &.{ existing, params.content });
-            defer allocator.free(merged);
+            const data = if (existing) |e| blk: {
+                const merged = try std.mem.concat(allocator, u8, &.{ e, params.content });
+                break :blk merged;
+            } else params.content;
+            defer if (existing != null) allocator.free(data);
 
             try std.Io.Dir.cwd().writeFile(ctx.io, .{
                 .sub_path = params.path,
-                .data = merged,
+                .data = data,
                 .flags = .{ .truncate = true },
             });
         },
