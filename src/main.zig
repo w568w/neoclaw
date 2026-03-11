@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const neoclaw = @import("neoclaw");
+const dotenv = @import("dotenv.zig");
 const LineEditor = @import("line_editor/editor.zig").LineEditor;
 
 const SystemPromptFile = "NEOCLAW.md";
@@ -24,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
 
     var editor = LineEditor.init(allocator);
     defer editor.deinit();
+
+    try dotenv.loadInto(allocator, init.environ_map, init.io);
 
     const api_key = try getEnvOwned(allocator, init.environ_map, "OPENAI_API_KEY", null);
     defer allocator.free(api_key);
