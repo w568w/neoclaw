@@ -23,15 +23,18 @@ const Job = struct {
 };
 
 pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.ToolStartResult {
-    const job = try allocator.create(Job);
-    errdefer allocator.destroy(job);
+    const code = try allocator.dupe(u8, params.code);
+    errdefer allocator.free(code);
+    const cwd = if (params.cwd) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (cwd) |c| allocator.free(c);
 
+    const job = try allocator.create(Job);
     job.* = .{
         .io = ctx.io,
         .code_type = params.type,
-        .code = try allocator.dupe(u8, params.code),
+        .code = code,
         .timeout = params.timeout,
-        .cwd = if (params.cwd) |cwd| try allocator.dupe(u8, cwd) else null,
+        .cwd = cwd,
     };
 
     return .{ .wait = .{ .worker = .{

@@ -100,11 +100,12 @@ pub fn finishReasonFromString(s: []const u8) FinishReason {
 }
 
 pub fn cloneToolCallOwned(allocator: Allocator, src: ToolCallView) !ToolCallOwned {
-    return .{
-        .id = try allocator.dupe(u8, src.id),
-        .name = try allocator.dupe(u8, src.name),
-        .arguments_json = try allocator.dupe(u8, src.arguments_json),
-    };
+    const id = try allocator.dupe(u8, src.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, src.name);
+    errdefer allocator.free(name);
+    const arguments_json = try allocator.dupe(u8, src.arguments_json);
+    return .{ .id = id, .name = name, .arguments_json = arguments_json };
 }
 
 /// Returns owned array and owned nested strings.
@@ -165,12 +166,12 @@ pub fn cloneMessagesOwnedSlice(allocator: Allocator, src: []const MessageOwned) 
     }
 
     for (src, 0..) |msg, i| {
-        dst[i] = .{
-            .role = msg.role,
-            .content = if (msg.content) |content| try allocator.dupe(u8, content) else null,
-            .tool_call_id = if (msg.tool_call_id) |id| try allocator.dupe(u8, id) else null,
-            .tool_calls = if (msg.tool_calls) |tool_calls| try cloneToolCallsOwnedSlice(allocator, tool_calls) else null,
-        };
+        const content = if (msg.content) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (content) |c| allocator.free(c);
+        const tool_call_id = if (msg.tool_call_id) |id| try allocator.dupe(u8, id) else null;
+        errdefer if (tool_call_id) |id| allocator.free(id);
+        const tool_calls = if (msg.tool_calls) |tc| try cloneToolCallsOwnedSlice(allocator, tc) else null;
+        dst[i] = .{ .role = msg.role, .content = content, .tool_call_id = tool_call_id, .tool_calls = tool_calls };
         filled = i + 1;
     }
     return dst;

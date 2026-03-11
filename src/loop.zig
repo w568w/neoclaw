@@ -738,20 +738,24 @@ pub const Runtime = struct {
 
     fn createAgent(self: *Runtime) !*Agent {
         const agent = try self.allocator.create(Agent);
+        errdefer self.allocator.destroy(agent);
         agent.* = .{
             .id = self.next_agent_id,
             .runtime = self,
             .allocator = self.allocator,
         };
+        errdefer agent.deinit(self.allocator);
         self.next_agent_id += 1;
-        try agent.history.append(self.allocator, .{ .role = .system, .content = try self.allocator.dupe(u8, self.config.system_prompt) });
+        {
+            const system_prompt = try self.allocator.dupe(u8, self.config.system_prompt);
+            errdefer self.allocator.free(system_prompt);
+            try agent.history.append(self.allocator, .{ .role = .system, .content = system_prompt });
+        }
         try self.agents.put(self.allocator, agent.id, agent);
 
         // Spawn the agent's process.
         self.worker_group.concurrent(self.io, agentMain, .{agent}) catch |err| {
             _ = self.agents.fetchSwapRemove(agent.id);
-            agent.deinit(self.allocator);
-            self.allocator.destroy(agent);
             return err;
         };
         return agent;
@@ -990,7 +994,7 @@ fn executeSyscall(agent: *Agent, request_id: RequestId, tc: openai.ToolCallOwned
 
 /// Wait for a tool_done signal matching the given syscall_id.
 /// Detached completions for other syscalls are queued as pending interrupts.
-fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: RequestId) struct { output: []const u8, ok: bool } {
+fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: RequestId) struct { output: []u8, ok: bool } {
     const runtime = agent.runtime;
     const allocator = agent.allocator;
     _ = request_id;
@@ -1006,7 +1010,8 @@ fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: Request
             switch (sig.*) {
                 .tool_done => |td| {
                     if (td.syscall_id == target_syscall_id and !td.detached) {
-                        const output = allocator.dupe(u8, td.output) catch "";
+                        const output = allocator.dupe(u8, td.output) catch
+                            return .{ .output = &.{}, .ok = false };
                         return .{ .output = output, .ok = td.ok };
                     }
                     // Detached completion for another syscall: emit event + re-queue as request.
@@ -1016,7 +1021,9 @@ fn waitToolDone(agent: *Agent, target_syscall_id: SyscallId, request_id: Request
                     }
                 },
                 .cancel => {
-                    return .{ .output = allocator.dupe(u8, "[CANCELED]") catch "", .ok = false };
+                    const output = allocator.dupe(u8, "[CANCELED]") catch
+                        return .{ .output = &.{}, .ok = false };
+                    return .{ .output = output, .ok = false };
                 },
                 .request => |*req| {
                     // Re-queue requests that arrive while waiting (ownership transfer).

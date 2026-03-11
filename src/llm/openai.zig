@@ -132,13 +132,11 @@ pub const Client = struct {
         var response = try req.receiveHead(&.{});
         if (response.head.status != .ok) return Error.HttpStatusNotOk;
 
-        var stream: ChatStream = .{
+        return .{
             .allocator = self.allocator,
             .request = req,
             .response = response,
         };
-        stream.reader = stream.response.reader(&stream.transfer_buffer);
-        return stream;
     }
 
     fn writeChatRequestBody(self: *Client, writer: *std.Io.Writer, messages: []const MessageView, tools_json: ?[]const u8, stream: bool) !void {
@@ -171,7 +169,7 @@ pub const ChatStream = struct {
     allocator: Allocator,
     request: std.http.Client.Request,
     response: std.http.Client.Response,
-    reader: *std.Io.Reader = undefined,
+    reader: ?*std.Io.Reader = null,
     transfer_buffer: [8192]u8 = undefined,
 
     content_builder: std.ArrayList(u8) = .empty,
@@ -208,6 +206,13 @@ pub const ChatStream = struct {
         self.* = undefined;
     }
 
+    fn getReader(self: *ChatStream) *std.Io.Reader {
+        return self.reader orelse {
+            self.reader = self.response.reader(&self.transfer_buffer);
+            return self.reader.?;
+        };
+    }
+
     /// Returns borrowed event data valid until next `next` call.
     pub fn next(self: *ChatStream) !?ChatDeltaEvent {
         if (self.closed) return null;
@@ -222,7 +227,7 @@ pub const ChatStream = struct {
                 return null;
             }
 
-            const line_opt = try self.reader.takeDelimiter('\n');
+            const line_opt = try self.getReader().takeDelimiter('\n');
             if (line_opt == null) {
                 self.closed = true;
                 if (!self.emitted_finished) {
@@ -270,11 +275,12 @@ pub const ChatStream = struct {
         }
 
         for (self.tool_builders.items, 0..) |*tb, i| {
-            tool_calls[i] = .{
-                .id = try tb.id.toOwnedSlice(self.allocator),
-                .name = try tb.name.toOwnedSlice(self.allocator),
-                .arguments_json = try tb.arguments_json.toOwnedSlice(self.allocator),
-            };
+            const id = try tb.id.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(id);
+            const name = try tb.name.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(name);
+            const arguments_json = try tb.arguments_json.toOwnedSlice(self.allocator);
+            tool_calls[i] = .{ .id = id, .name = name, .arguments_json = arguments_json };
             filled = i + 1;
         }
 
@@ -430,11 +436,12 @@ fn parseChatResponse(allocator: Allocator, body: []const u8) !ChatResponse {
     }
 
     for (raw_tool_calls, 0..) |raw_tc, i| {
-        tool_calls[i] = .{
-            .id = try allocator.dupe(u8, raw_tc.id),
-            .name = try allocator.dupe(u8, raw_tc.function.name),
-            .arguments_json = try allocator.dupe(u8, raw_tc.function.arguments),
-        };
+        const id = try allocator.dupe(u8, raw_tc.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, raw_tc.function.name);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, raw_tc.function.arguments);
+        tool_calls[i] = .{ .id = id, .name = name, .arguments_json = arguments_json };
         filled = i + 1;
     }
 
