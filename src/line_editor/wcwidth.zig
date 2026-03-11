@@ -4,50 +4,24 @@ const zero_width_cf = @import("wcwidth_manual.zig").zero_width_cf;
 const wide_eastasian = @import("wcwidth_table_wide.zig").wide_eastasian;
 const zero_width = @import("wcwidth_table_zero.zig").zero_width;
 
+const binarySearch = std.sort.binarySearch;
+
 fn tableBisearch(ucs: u21, table: []const [2]u21) bool {
-    if (table.len == 0) return false;
-
-    var low: usize = 0;
-    var high: usize = table.len - 1;
-
-    if (ucs < table[low][0] or ucs > table[high][1]) return false;
-
-    while (high >= low) {
-        const mid = (low + high) / 2;
-        if (ucs > table[mid][1]) {
-            low = mid + 1;
-        } else if (ucs < table[mid][0]) {
-            if (mid == 0) return false;
-            high = mid - 1;
-        } else {
-            return true;
+    return binarySearch([2]u21, table, ucs, struct {
+        fn order(cp: u21, range: [2]u21) std.math.Order {
+            if (cp < range[0]) return .lt;
+            if (cp > range[1]) return .gt;
+            return .eq;
         }
-    }
-
-    return false;
+    }.order) != null;
 }
 
 fn listBisearch(ucs: u21, list: []const u21) bool {
-    if (list.len == 0) return false;
-
-    var low: usize = 0;
-    var high: usize = list.len - 1;
-
-    if (ucs < list[low] or ucs > list[high]) return false;
-
-    while (high >= low) {
-        const mid = (low + high) / 2;
-        if (ucs > list[mid]) {
-            low = mid + 1;
-        } else if (ucs < list[mid]) {
-            if (mid == 0) return false;
-            high = mid - 1;
-        } else {
-            return true;
+    return binarySearch(u21, list, ucs, struct {
+        fn order(cp: u21, item: u21) std.math.Order {
+            return std.math.order(cp, item);
         }
-    }
-
-    return false;
+    }.order) != null;
 }
 
 /// Returns terminal column width for one Unicode codepoint.
