@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const source_url = "https://raw.githubusercontent.com/unicode-rs/unicode-segmentation/master/src/tables.rs";
-const out_path = "src/line_editor/grapheme_tables.zig";
+const out_path = "src/generated/grapheme_tables.zig";
 
 const Cat = enum {
     GC_CR,

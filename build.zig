@@ -16,6 +16,18 @@ pub fn build(b: *std.Build) void {
     const gen_unicode_step = b.step("gen-unicode", "Regenerate grapheme tables from upstream Unicode data");
     gen_unicode_step.dependOn(&gen_unicode_run.step);
 
+    const gen_cacert_exe = b.addExecutable(.{
+        .name = "gen-cacert",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_cacert.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const gen_cacert_run = b.addRunArtifact(gen_cacert_exe);
+    const gen_cacert_step = b.step("gen-cacert", "Download Mozilla CA certificates from curl.se and generate embedded bundle");
+    gen_cacert_step.dependOn(&gen_cacert_run.step);
+
     const mod = b.addModule("neoclaw", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

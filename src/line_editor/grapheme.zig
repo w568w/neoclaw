@@ -1,5 +1,5 @@
 const std = @import("std");
-const tables = @import("grapheme_tables.zig");
+const tables = @import("../generated/grapheme_tables.zig");
 
 const Gcb = enum {
     other,

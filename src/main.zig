@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const neoclaw = @import("neoclaw");
 const dotenv = @import("dotenv.zig");
+const cacert = @import("generated/cacert.zig");
 const LineEditor = @import("line_editor/editor.zig").LineEditor;
 
 const SystemPromptFile = "NEOCLAW.md";
@@ -44,6 +45,8 @@ pub fn main(init: std.process.Init) !void {
         .model = model,
     });
     defer client.deinit();
+
+    try initCaBundle(&client.http_client, allocator, io);
 
     var tool_ctx = neoclaw.schema.ToolContext{ .io = io };
     var registry = ToolRegistry.init(&tool_ctx);
@@ -191,6 +194,15 @@ fn consumeUntilFinished(
 
 fn loadSystemPrompt(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, SystemPromptFile, allocator, .limited(256 * 1024));
+}
+
+fn initCaBundle(http_client: *std.http.Client, allocator: std.mem.Allocator, io: Io) !void {
+    const now = Io.Clock.real.now(io);
+    http_client.now = now;
+    http_client.ca_bundle.rescan(allocator, io, now) catch {};
+    if (http_client.ca_bundle.map.count() == 0) {
+        try cacert.addToBundle(&http_client.ca_bundle, allocator, now.toSeconds());
+    }
 }
 
 fn getEnvOwned(
