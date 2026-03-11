@@ -254,7 +254,6 @@ pub const ChatStream = struct {
     pub fn takeResponseOwned(self: *ChatStream) !ChatResponse {
         if (!self.closed) return Client.Error.StreamNotFinished;
         if (self.response_taken) return Client.Error.StreamAlreadyTaken;
-        self.response_taken = true;
 
         const content = try self.content_builder.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(content);
@@ -283,6 +282,7 @@ pub const ChatStream = struct {
             filled = i + 1;
         }
 
+        self.response_taken = true;
         return .{ .content = content, .finish_reason = finish_reason, .tool_calls = tool_calls };
     }
 
