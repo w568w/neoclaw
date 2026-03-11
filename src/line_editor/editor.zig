@@ -1,8 +1,7 @@
 const std = @import("std");
-const posix = std.posix;
-const linux = std.os.linux;
 const wc = @import("wcwidth.zig");
 const grapheme = @import("grapheme.zig");
+const Terminal = @import("terminal.zig").Terminal;
 
 const Allocator = std.mem.Allocator;
 
@@ -13,7 +12,7 @@ pub const LineEditor = struct {
     history_entries: std.ArrayList([]const u8) = .empty,
     history_index: usize = 0,
     saved_line: std.ArrayList(u8) = .empty,
-    orig_termios: ?posix.termios = null,
+    terminal: Terminal = .{},
 
     pub fn init(allocator: Allocator) LineEditor {
         return .{ .allocator = allocator };
@@ -33,27 +32,26 @@ pub const LineEditor = struct {
         self.history_index = self.history_entries.items.len;
         self.saved_line.clearRetainingCapacity();
 
-        const raw_enabled = self.enableRawMode() catch |err| switch (err) {
-            error.NotATerminal => false,
-            else => return err,
+        const raw_enabled = self.terminal.enableRawMode() catch |err| {
+            if (err == error.NotATerminal) return self.readLineCooked(prompt);
+            return err;
         };
         if (!raw_enabled) return self.readLineCooked(prompt);
-        defer self.disableRawMode();
+        defer self.terminal.disableRawMode();
 
-        try writeAllStdout(prompt);
+        self.terminal.writeAll(prompt);
 
         while (true) {
-            const b = readByte() catch return null;
+            const b = self.terminal.readByte() catch return null;
 
             if (b == '\r' or b == '\n') {
-                try writeAllStdout("\r\n");
-                const result = try self.allocator.dupe(u8, self.buf.items);
-                return result;
+                self.terminal.writeAll("\r\n");
+                return try self.allocator.dupe(u8, self.buf.items);
             }
 
             if (b == 4) { // Ctrl-D
                 if (self.buf.items.len == 0) {
-                    try writeAllStdout("\r\n");
+                    self.terminal.writeAll("\r\n");
                     return null;
                 }
                 continue;
@@ -62,8 +60,8 @@ pub const LineEditor = struct {
             if (b == 3) { // Ctrl-C
                 self.buf.clearRetainingCapacity();
                 self.cursor = 0;
-                try writeAllStdout("^C\r\n");
-                try writeAllStdout(prompt);
+                self.terminal.writeAll("^C\r\n");
+                self.terminal.writeAll(prompt);
                 continue;
             }
 
@@ -74,16 +72,16 @@ pub const LineEditor = struct {
                     std.mem.copyForwards(u8, self.buf.items[from..], self.buf.items[self.cursor..]);
                     self.buf.items.len -= prev_len;
                     self.cursor -= prev_len;
-                    try self.refreshLine(prompt);
+                    self.refreshLine(prompt);
                 }
                 continue;
             }
 
             if (b == 27) { // ESC
-                const b2 = readByte() catch continue;
+                const b2 = self.terminal.readByte() catch continue;
                 if (b2 == '[') {
-                    const b3 = readByte() catch continue;
-                    const csi = parseCsi(b3) orelse continue;
+                    const b3 = self.terminal.readByte() catch continue;
+                    const csi = self.parseCsi(b3) orelse continue;
                     switch (csi.final) {
                         'A' => { // Up
                             try self.historyPrev(prompt);
@@ -98,11 +96,11 @@ pub const LineEditor = struct {
                                 const next = moveWordRight(self.buf.items, self.cursor);
                                 if (next != self.cursor) {
                                     self.cursor = next;
-                                    try self.refreshLine(prompt);
+                                    self.refreshLine(prompt);
                                 }
                             } else if (self.cursor < self.buf.items.len) {
                                 self.cursor += grapheme.nextLen(self.buf.items, self.cursor);
-                                try self.refreshLine(prompt);
+                                self.refreshLine(prompt);
                             }
                             continue;
                         },
@@ -111,22 +109,22 @@ pub const LineEditor = struct {
                                 const prev = moveWordLeft(self.buf.items, self.cursor);
                                 if (prev != self.cursor) {
                                     self.cursor = prev;
-                                    try self.refreshLine(prompt);
+                                    self.refreshLine(prompt);
                                 }
                             } else if (self.cursor > 0) {
                                 self.cursor -= grapheme.prevLen(self.buf.items, self.cursor);
-                                try self.refreshLine(prompt);
+                                self.refreshLine(prompt);
                             }
                             continue;
                         },
                         'H' => { // Home
                             self.cursor = 0;
-                            try self.refreshLine(prompt);
+                            self.refreshLine(prompt);
                             continue;
                         },
                         'F' => { // End
                             self.cursor = self.buf.items.len;
-                            try self.refreshLine(prompt);
+                            self.refreshLine(prompt);
                             continue;
                         },
                         '~' => {
@@ -135,7 +133,7 @@ pub const LineEditor = struct {
                                     const next_len = grapheme.nextLen(self.buf.items, self.cursor);
                                     std.mem.copyForwards(u8, self.buf.items[self.cursor..], self.buf.items[self.cursor + next_len ..]);
                                     self.buf.items.len -= next_len;
-                                    try self.refreshLine(prompt);
+                                    self.refreshLine(prompt);
                                 }
                             }
                             continue;
@@ -148,19 +146,19 @@ pub const LineEditor = struct {
 
             if (b == 1) { // Ctrl-A (Home)
                 self.cursor = 0;
-                try self.refreshLine(prompt);
+                self.refreshLine(prompt);
                 continue;
             }
 
             if (b == 5) { // Ctrl-E (End)
                 self.cursor = self.buf.items.len;
-                try self.refreshLine(prompt);
+                self.refreshLine(prompt);
                 continue;
             }
 
             if (b == 11) { // Ctrl-K (kill to end)
                 self.buf.items.len = self.cursor;
-                try self.refreshLine(prompt);
+                self.refreshLine(prompt);
                 continue;
             }
 
@@ -168,13 +166,13 @@ pub const LineEditor = struct {
                 std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[self.cursor..]);
                 self.buf.items.len -= self.cursor;
                 self.cursor = 0;
-                try self.refreshLine(prompt);
+                self.refreshLine(prompt);
                 continue;
             }
 
             if (b == 12) { // Ctrl-L (clear screen)
-                try writeAllStdout("\x1b[2J\x1b[H");
-                try self.refreshLine(prompt);
+                self.terminal.writeAll("\x1b[2J\x1b[H");
+                self.refreshLine(prompt);
                 continue;
             }
 
@@ -185,13 +183,13 @@ pub const LineEditor = struct {
                 char_buf[0] = b;
                 var i: usize = 1;
                 while (i < char_len) : (i += 1) {
-                    char_buf[i] = readByte() catch break;
+                    char_buf[i] = self.terminal.readByte() catch break;
                 }
                 if (i == char_len) {
                     const insert_pos = self.cursor;
                     try self.buf.insertSlice(self.allocator, insert_pos, char_buf[0..char_len]);
                     self.cursor += char_len;
-                    try self.refreshLine(prompt);
+                    self.refreshLine(prompt);
                 }
                 continue;
             }
@@ -199,20 +197,18 @@ pub const LineEditor = struct {
     }
 
     fn readLineCooked(self: *LineEditor, prompt: []const u8) !?[]const u8 {
-        try writeAllStdout(prompt);
+        self.terminal.writeAll(prompt);
         while (true) {
-            const b = readByte() catch |err| switch (err) {
+            const b = self.terminal.readByte() catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.buf.items.len == 0) return null;
-                    const owned = try self.allocator.dupe(u8, self.buf.items);
-                    return owned;
+                    return try self.allocator.dupe(u8, self.buf.items);
                 },
                 else => return err,
             };
 
             if (b == '\n') {
-                const owned = try self.allocator.dupe(u8, self.buf.items);
-                return owned;
+                return try self.allocator.dupe(u8, self.buf.items);
             }
             if (b == '\r') continue;
             try self.buf.append(self.allocator, b);
@@ -242,7 +238,7 @@ pub const LineEditor = struct {
         self.buf.clearRetainingCapacity();
         try self.buf.appendSlice(self.allocator, entry);
         self.cursor = self.buf.items.len;
-        try self.refreshLine(prompt);
+        self.refreshLine(prompt);
     }
 
     fn historyNext(self: *LineEditor, prompt: []const u8) !void {
@@ -260,10 +256,10 @@ pub const LineEditor = struct {
             try self.buf.appendSlice(self.allocator, entry);
             self.cursor = self.buf.items.len;
         }
-        try self.refreshLine(prompt);
+        self.refreshLine(prompt);
     }
 
-    fn refreshLine(self: *LineEditor, prompt: []const u8) !void {
+    fn refreshLine(self: *LineEditor, prompt: []const u8) void {
         var out_buf: [8192]u8 = undefined;
         var pos: usize = 0;
 
@@ -296,100 +292,46 @@ pub const LineEditor = struct {
         const cursor_cmd = std.fmt.bufPrint(out_buf[pos..], "\r\x1b[{d}C", .{display_cursor}) catch return;
         pos += cursor_cmd.len;
 
-        writeAllFd(posix.STDOUT_FILENO, out_buf[0..pos]);
+        self.terminal.writeAll(out_buf[0..pos]);
     }
 
-    fn enableRawMode(self: *LineEditor) !bool {
-        self.orig_termios = try posix.tcgetattr(posix.STDIN_FILENO);
-        var raw = self.orig_termios.?;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.ISIG = false;
-        raw.iflag.IXON = false;
-        raw.iflag.ICRNL = false;
-        raw.cc[@intFromEnum(std.os.linux.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.os.linux.V.TIME)] = 0;
-        try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw);
-        return true;
-    }
+    const Csi = struct {
+        final: u8,
+        p1: usize = 0,
+        p2: usize = 0,
+        ctrl: bool = false,
+    };
 
-    fn disableRawMode(self: *LineEditor) void {
-        if (self.orig_termios) |orig| {
-            posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, orig) catch {};
-            self.orig_termios = null;
+    fn parseCsi(self: *LineEditor, first: u8) ?Csi {
+        var csi: Csi = .{ .final = first };
+        var buf: [16]u8 = undefined;
+        var len: usize = 0;
+        var b = first;
+
+        while (true) {
+            if ((b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z') or b == '~') {
+                csi.final = b;
+                break;
+            }
+            if (len >= buf.len) return null;
+            buf[len] = b;
+            len += 1;
+            b = self.terminal.readByte() catch return null;
         }
+
+        if (len == 0) return csi;
+
+        var it = std.mem.splitScalar(u8, buf[0..len], ';');
+        if (it.next()) |p1s| {
+            csi.p1 = std.fmt.parseInt(usize, p1s, 10) catch 0;
+        }
+        if (it.next()) |p2s| {
+            csi.p2 = std.fmt.parseInt(usize, p2s, 10) catch 0;
+        }
+        csi.ctrl = csi.p2 == 5;
+        return csi;
     }
 };
-
-fn readByte() !u8 {
-    var buf: [1]u8 = undefined;
-    while (true) {
-        const rc = linux.read(posix.STDIN_FILENO, &buf, 1);
-        const e = linux.errno(rc);
-        if (e == .SUCCESS) {
-            if (rc == 0) return error.EndOfStream;
-            return buf[0];
-        }
-        if (e == .INTR) continue;
-        return error.ReadFailed;
-    }
-}
-
-fn writeAllStdout(data: []const u8) !void {
-    writeAllFd(posix.STDOUT_FILENO, data);
-}
-
-fn writeAllFd(fd: i32, data: []const u8) void {
-    var written: usize = 0;
-    while (written < data.len) {
-        const rc = linux.write(fd, data[written..].ptr, data.len - written);
-        const e = linux.errno(rc);
-        if (e == .SUCCESS) {
-            written += rc;
-        } else if (e == .INTR) {
-            continue;
-        } else {
-            return;
-        }
-    }
-}
-
-const Csi = struct {
-    final: u8,
-    p1: usize = 0,
-    p2: usize = 0,
-    ctrl: bool = false,
-};
-
-fn parseCsi(first: u8) ?Csi {
-    var csi: Csi = .{ .final = first };
-    var buf: [16]u8 = undefined;
-    var len: usize = 0;
-    var b = first;
-
-    while (true) {
-        if ((b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z') or b == '~') {
-            csi.final = b;
-            break;
-        }
-        if (len >= buf.len) return null;
-        buf[len] = b;
-        len += 1;
-        b = readByte() catch return null;
-    }
-
-    if (len == 0) return csi;
-
-    var it = std.mem.splitScalar(u8, buf[0..len], ';');
-    if (it.next()) |p1s| {
-        csi.p1 = std.fmt.parseInt(usize, p1s, 10) catch 0;
-    }
-    if (it.next()) |p2s| {
-        csi.p2 = std.fmt.parseInt(usize, p2s, 10) catch 0;
-    }
-    csi.ctrl = csi.p2 == 5;
-    return csi;
-}
 
 fn firstCodepointAt(buf: []const u8, pos: usize) u21 {
     const step = grapheme.nextLen(buf, pos);

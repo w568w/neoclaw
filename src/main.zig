@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const neoclaw = @import("neoclaw");
-const LineEditor = @import("line_editor.zig").LineEditor;
+const LineEditor = @import("line_editor/editor.zig").LineEditor;
 
 const SystemPromptFile = "NEOCLAW.md";
 const MaxTurns: u32 = 40;
