@@ -233,10 +233,11 @@ pub const LineEditor = struct {
             try self.saved_line.appendSlice(self.allocator, self.buf.items);
         }
 
-        self.history_index -= 1;
-        const entry = self.history_entries.items[self.history_index];
+        const new_index = self.history_index - 1;
+        const entry = self.history_entries.items[new_index];
         self.buf.clearRetainingCapacity();
         try self.buf.appendSlice(self.allocator, entry);
+        self.history_index = new_index;
         self.cursor = self.buf.items.len;
         self.refreshLine(prompt);
     }
@@ -244,18 +245,19 @@ pub const LineEditor = struct {
     fn historyNext(self: *LineEditor, prompt: []const u8) !void {
         if (self.history_index >= self.history_entries.items.len) return;
 
-        self.history_index += 1;
+        const new_index = self.history_index + 1;
 
-        if (self.history_index == self.history_entries.items.len) {
+        if (new_index == self.history_entries.items.len) {
             self.buf.clearRetainingCapacity();
             try self.buf.appendSlice(self.allocator, self.saved_line.items);
             self.cursor = self.buf.items.len;
         } else {
-            const entry = self.history_entries.items[self.history_index];
+            const entry = self.history_entries.items[new_index];
             self.buf.clearRetainingCapacity();
             try self.buf.appendSlice(self.allocator, entry);
             self.cursor = self.buf.items.len;
         }
+        self.history_index = new_index;
         self.refreshLine(prompt);
     }
 
@@ -263,25 +265,22 @@ pub const LineEditor = struct {
         var out_buf: [8192]u8 = undefined;
         var pos: usize = 0;
 
+        // Reserve space for escape sequences at the end (clear + cursor).
+        const reserved_tail = 32;
+
         // \r: move to column 0
         out_buf[pos] = '\r';
         pos += 1;
 
-        // write prompt
-        @memcpy(out_buf[pos..][0..prompt.len], prompt);
-        pos += prompt.len;
+        // write prompt (truncate if too long)
+        const prompt_avail = @min(prompt.len, out_buf.len - pos - reserved_tail);
+        @memcpy(out_buf[pos..][0..prompt_avail], prompt[0..prompt_avail]);
+        pos += prompt_avail;
 
-        // write buffer content
-        const buf_len = self.buf.items.len;
-        if (pos + buf_len + 16 > out_buf.len) {
-            // fallback: just write what fits
-            const avail = out_buf.len - pos - 16;
-            @memcpy(out_buf[pos..][0..avail], self.buf.items[0..avail]);
-            pos += avail;
-        } else {
-            @memcpy(out_buf[pos..][0..buf_len], self.buf.items);
-            pos += buf_len;
-        }
+        // write buffer content (truncate if too long)
+        const buf_avail = @min(self.buf.items.len, out_buf.len - pos - reserved_tail);
+        @memcpy(out_buf[pos..][0..buf_avail], self.buf.items[0..buf_avail]);
+        pos += buf_avail;
 
         // \x1b[K: clear to end of line
         @memcpy(out_buf[pos..][0..3], "\x1b[K");
