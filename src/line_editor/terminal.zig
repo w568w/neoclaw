@@ -21,8 +21,8 @@ const PosixTerminal = struct {
         raw.lflag.ISIG = false;
         raw.iflag.IXON = false;
         raw.iflag.ICRNL = false;
-        raw.cc[@intFromEnum(std.os.linux.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.os.linux.V.TIME)] = 0;
+        raw.cc[@intFromEnum(posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
         try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw);
         return true;
     }
