@@ -276,7 +276,7 @@ pub const Agent = struct {
             loop.debugLog("processUpdate agent={d} trigger={d} turn={d}", .{ self.id, trigger_id, turn });
 
             // 1. call LLM
-            const response = self.callLlm(trigger_id) catch |err| switch (err) {
+            var response = self.callLlm(trigger_id) catch |err| switch (err) {
                 error.Canceled => {
                     loop.debugLog("processUpdate agent={d} callLlm canceled", .{self.id});
                     // Append [CANCELED] assistant message to keep history consistent.
@@ -431,7 +431,7 @@ pub const Agent = struct {
                 self.kernel.spawnToolWorker(self.id, syscall_id, det.job, true);
                 self.active_tool_ids.put(allocator, syscall_id, owned_tc_id) catch {
                     loop.debugLog("executeSyscall agent={d} failed to track active detached tool syscall={d}", .{ self.id, syscall_id });
-                    if (owned_tc_id) |id| allocator.free(id);
+                    allocator.free(owned_tc_id);
                 };
             },
         }
