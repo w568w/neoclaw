@@ -62,4 +62,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_cancel.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "neoclaw", .module = mod },
+            },
+        }),
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const integration_test_step = b.step("integration-test", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
 }
