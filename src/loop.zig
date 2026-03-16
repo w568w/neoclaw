@@ -13,8 +13,21 @@ pub fn debugLog(comptime fmt: []const u8, args: anytype) void {
 
 pub const EventSeq = u64;
 pub const AgentId = u64;
-pub const RequestId = u64;
+pub const TriggerId = u64;
 pub const SyscallId = u64;
+
+/// A monotonically increasing ID allocator. IDs start at 1; 0 is never issued.
+pub fn IdPool(Id: type) type {
+    return struct {
+        next: Id = 1,
+
+        pub fn allocate(self: *@This()) Id {
+            const id = self.next;
+            self.next += 1;
+            return id;
+        }
+    };
+}
 
 pub const Priority = enum {
     interactive,
@@ -30,12 +43,13 @@ pub const SubscribeFrom = union(enum) {
 pub const ToolJob = struct {
     ptr: *anyopaque,
     /// Runs synchronously and returns an owned output buffer.
-    runFn: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror![]const u8,
+    /// The `io` parameter enables cancelable I/O within the tool.
+    runFn: *const fn (ptr: *anyopaque, allocator: Allocator, io: std.Io) anyerror![]const u8,
     /// Releases the job payload.
     deinitFn: *const fn (ptr: *anyopaque, allocator: Allocator) void,
 
-    pub fn run(self: ToolJob, allocator: Allocator) ![]const u8 {
-        return self.runFn(self.ptr, allocator);
+    pub fn run(self: ToolJob, allocator: Allocator, io: std.Io) ![]const u8 {
+        return self.runFn(self.ptr, allocator, io);
     }
 
     pub fn deinit(self: ToolJob, allocator: Allocator) void {
@@ -96,11 +110,11 @@ pub const ToolKernel = struct {
 pub const Event = union(enum) {
     accepted: struct {
         agent_id: AgentId,
-        request_id: ?RequestId,
+        trigger_id: ?TriggerId,
     },
     started: struct {
         agent_id: AgentId,
-        request_id: ?RequestId,
+        trigger_id: ?TriggerId,
     },
     assistant_delta: struct {
         agent_id: AgentId,
@@ -131,9 +145,18 @@ pub const Event = union(enum) {
         syscall_id: SyscallId,
         question: []const u8,
     },
+    message_incomplete: struct {
+        agent_id: AgentId,
+        trigger_id: ?TriggerId,
+        partial_content: []const u8,
+    },
+    tool_cancelled: struct {
+        agent_id: AgentId,
+        syscall_id: SyscallId,
+    },
     finished: struct {
         agent_id: AgentId,
-        request_id: ?RequestId,
+        trigger_id: ?TriggerId,
         final_text: []const u8,
     },
     fault: struct {
@@ -151,7 +174,9 @@ pub const Event = union(enum) {
             .tool_detached => |ev| .{ .tool_detached = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .ack = try allocator.dupe(u8, ev.ack) } },
             .tool_completed => |ev| .{ .tool_completed = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .output = try allocator.dupe(u8, ev.output), .ok = ev.ok } },
             .waiting_user => |ev| .{ .waiting_user = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .question = try allocator.dupe(u8, ev.question) } },
-            .finished => |ev| .{ .finished = .{ .agent_id = ev.agent_id, .request_id = ev.request_id, .final_text = try allocator.dupe(u8, ev.final_text) } },
+            .message_incomplete => |ev| .{ .message_incomplete = .{ .agent_id = ev.agent_id, .trigger_id = ev.trigger_id, .partial_content = try allocator.dupe(u8, ev.partial_content) } },
+            .tool_cancelled => |ev| .{ .tool_cancelled = ev },
+            .finished => |ev| .{ .finished = .{ .agent_id = ev.agent_id, .trigger_id = ev.trigger_id, .final_text = try allocator.dupe(u8, ev.final_text) } },
             .fault => |ev| .{ .fault = .{ .agent_id = ev.agent_id, .message = try allocator.dupe(u8, ev.message) } },
         };
     }
@@ -166,6 +191,8 @@ pub const Event = union(enum) {
             .tool_detached => |ev| allocator.free(ev.ack),
             .tool_completed => |ev| allocator.free(ev.output),
             .waiting_user => |ev| allocator.free(ev.question),
+            .message_incomplete => |ev| allocator.free(ev.partial_content),
+            .tool_cancelled => {},
             .finished => |ev| allocator.free(ev.final_text),
             .fault => |ev| allocator.free(ev.message),
         }
@@ -194,7 +221,7 @@ pub const Subscription = struct {
 pub const SubmitReceipt = struct {
     accepted_seq: EventSeq,
     agent_id: AgentId,
-    request_id: ?RequestId,
+    trigger_id: ?TriggerId,
 };
 
 pub const CancelReceipt = struct {
@@ -215,12 +242,19 @@ pub const CancelError = error{
     OutOfMemory,
 };
 
-// 3. Signal protocol (kernel -> userspace communication).
+// 3. Mail protocol (kernel -> userspace communication).
 
 pub const Request = struct {
-    id: RequestId,
+    id: TriggerId,
     text: ?[]const u8,
     priority: Priority,
+
+    /// Takes ownership of the text field, returning it and clearing the field.
+    pub fn takeText(self: *Request) ?[]const u8 {
+        const t = self.text;
+        self.text = null;
+        return t;
+    }
 
     pub fn deinit(self: *Request, allocator: Allocator) void {
         if (self.text) |t| allocator.free(t);
@@ -228,7 +262,7 @@ pub const Request = struct {
     }
 };
 
-pub const Signal = union(enum) {
+pub const Mail = union(enum) {
     request: Request,
     tool_done: struct {
         syscall_id: SyscallId,
@@ -236,13 +270,11 @@ pub const Signal = union(enum) {
         ok: bool,
         detached: bool,
     },
-    cancel,
 
-    pub fn deinit(self: *Signal, allocator: Allocator) void {
+    pub fn deinit(self: *Mail, allocator: Allocator) void {
         switch (self.*) {
             .request => |*req| req.deinit(allocator),
             .tool_done => |td| allocator.free(td.output),
-            .cancel => {},
         }
         self.* = undefined;
     }
@@ -257,8 +289,11 @@ pub const KernelServices = struct {
     emitEventFn: *const fn (ctx: *anyopaque, event: Event) anyerror!EventSeq,
     startToolFn: *const fn (ctx: *anyopaque, tool_name: []const u8, args_json: []const u8, allocator: Allocator) anyerror!ToolStartResult,
     spawnToolWorkerFn: *const fn (ctx: *anyopaque, agent_id: AgentId, syscall_id: SyscallId, job: ToolJob, detached: bool) void,
+    cancelToolFn: *const fn (ctx: *anyopaque, syscall_id: SyscallId) void,
     isShutdownFn: *const fn (ctx: *anyopaque) bool,
 
+    // Emits an event to the kernel.
+    // The `event` is cloned and owned by the kernel, so the caller can safely free any buffers after this call returns.
     pub fn emitEvent(self: KernelServices, event: Event) !EventSeq {
         return self.emitEventFn(self.ctx, event);
     }
@@ -269,6 +304,10 @@ pub const KernelServices = struct {
 
     pub fn spawnToolWorker(self: KernelServices, agent_id: AgentId, syscall_id: SyscallId, job: ToolJob, detached: bool) void {
         self.spawnToolWorkerFn(self.ctx, agent_id, syscall_id, job, detached);
+    }
+
+    pub fn cancelTool(self: KernelServices, syscall_id: SyscallId) void {
+        self.cancelToolFn(self.ctx, syscall_id);
     }
 
     pub fn isShutdown(self: KernelServices) bool {
@@ -290,14 +329,13 @@ pub const EventLog = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     events: std.ArrayList(EventRecord) = .empty,
-    next_seq: EventSeq = 1,
+    seqs: IdPool(EventSeq) = .{},
     shutdown: bool = false,
 
     pub fn append(self: *EventLog, event: Event) !EventSeq {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const seq = self.next_seq;
-        self.next_seq += 1;
+        const seq = self.seqs.allocate();
         try self.events.append(self.allocator, try EventRecord.clone(self.allocator, event, seq));
         self.cond.broadcast(self.io);
         return seq;
@@ -308,7 +346,7 @@ pub const EventLog = struct {
         defer self.mutex.unlock(self.io);
         return .{ .next_seq = switch (from) {
             .beginning => 1,
-            .tail => self.next_seq,
+            .tail => self.seqs.next,
             .seq => |seq| seq,
         } };
     }
@@ -317,13 +355,13 @@ pub const EventLog = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        while (sub.next_seq >= self.next_seq and !self.shutdown) {
+        while (sub.next_seq >= self.seqs.next and !self.shutdown) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
 
-        if (sub.next_seq >= self.next_seq and self.shutdown) return null;
+        if (sub.next_seq >= self.seqs.next and self.shutdown) return null;
 
-        if (sub.next_seq < self.next_seq) {
+        if (sub.next_seq < self.seqs.next) {
             const idx: usize = @intCast(sub.next_seq - 1);
             const record = self.events.items[idx];
             sub.next_seq = record.seq + 1;
@@ -335,7 +373,7 @@ pub const EventLog = struct {
     pub fn peekNextSeq(self: *EventLog) EventSeq {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.next_seq;
+        return self.seqs.next;
     }
 
     pub fn signalShutdown(self: *EventLog) void {
@@ -354,5 +392,6 @@ pub const EventLog = struct {
 
 // 6. Re-exports: userspace and kernel.
 
+pub const Mailbox = @import("loop/mailbox.zig").Mailbox;
 pub const Agent = @import("loop/agent.zig").Agent;
 pub const Runtime = @import("loop/runtime.zig").Runtime;

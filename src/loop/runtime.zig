@@ -4,12 +4,13 @@ const loop = @import("../loop.zig");
 const Agent = loop.Agent;
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 const InboxItem = struct {
     node: std.DoublyLinkedList.Node = .{},
     msg: Msg,
-    mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
     done: bool = false,
     result: Result = .pending,
 
@@ -65,27 +66,37 @@ const InboxItem = struct {
 pub const Runtime = struct {
     // -- Dependencies (injected, not owned) --
     allocator: Allocator,
-    io: std.Io,
+    io: Io,
     client: *openai.Client,
     tool_kernel: loop.ToolKernel,
     config: loop.RuntimeConfig,
 
     // -- Kernel synchronization --
-    // Protects `inbox`, `agents`, `shutdown`, and `next_agent_id`.
-    // Lock ordering: Runtime.mutex -> Agent.signal_mutex -> InboxItem.mutex.
-    mutex: std.Io.Mutex = .init,
-    inbox_cond: std.Io.Condition = .init,
+    // Protects `inbox`, `agents`, `shutdown`, `agent_ids`, and `tool_futures`.
+    // Lock ordering: Runtime.mutex -> Agent.mail_mutex -> InboxItem.mutex.
+    mutex: Io.Mutex = .init,
+    inbox_cond: Io.Condition = .init,
     runtime_thread: ?std.Thread = null,
     shutdown: bool = false,
-    worker_group: std.Io.Group = .init,
+    agent_group: Io.Group = .init,
 
     // -- Agent registry and event log --
     agents: std.AutoArrayHashMapUnmanaged(loop.AgentId, *Agent) = .empty,
     event_log: loop.EventLog,
     inbox: std.DoublyLinkedList = .{},
-    next_agent_id: loop.AgentId = 1,
+    agent_ids: loop.IdPool(loop.AgentId) = .{},
 
-    pub fn init(allocator: Allocator, io: std.Io, client: *openai.Client, tool_kernel: loop.ToolKernel, config: loop.RuntimeConfig) Runtime {
+    // -- Tool future tracking --
+    // Each tool worker gets an individual Future so it can be cancelled independently.
+    tool_futures: std.AutoArrayHashMapUnmanaged(loop.SyscallId, *ToolFutureEntry) = .empty,
+    tool_futures_mutex: Io.Mutex = .init,
+
+    const ToolFutureEntry = struct {
+        future: Io.Future(void),
+        agent_id: loop.AgentId,
+    };
+
+    pub fn init(allocator: Allocator, io: Io, client: *openai.Client, tool_kernel: loop.ToolKernel, config: loop.RuntimeConfig) Runtime {
         return .{
             .allocator = allocator,
             .io = io,
@@ -100,12 +111,24 @@ pub const Runtime = struct {
         self.mutex.lockUncancelable(self.io);
         self.shutdown = true;
         self.inbox_cond.broadcast(self.io);
-        for (self.agents.values()) |agent| agent.enqueueSignal(self.allocator, .cancel) catch {};
+        // Wake up all agent signal receiver threads so they can exit.
+        for (self.agents.values()) |agent| agent.cancel_event.set(self.io);
         self.mutex.unlock(self.io);
         self.event_log.signalShutdown();
 
         if (self.runtime_thread) |thread| thread.join();
-        self.worker_group.await(self.io) catch {};
+
+        // Wait for all agent threads to finish.
+        self.agent_group.await(self.io) catch {};
+
+        // Cancel all remaining tool futures.
+        self.tool_futures_mutex.lockUncancelable(self.io);
+        for (self.tool_futures.values()) |entry| {
+            _ = entry.future.cancel(self.io);
+            self.allocator.destroy(entry);
+        }
+        self.tool_futures.deinit(self.allocator);
+        self.tool_futures_mutex.unlock(self.io);
 
         while (self.inbox.popFirst()) |node| {
             const item: *InboxItem = @fieldParentPtr("node", node);
@@ -114,7 +137,7 @@ pub const Runtime = struct {
         }
         self.event_log.deinit();
         for (self.agents.values()) |agent| {
-            agent.deinit(self.allocator);
+            agent.deinit();
             self.allocator.destroy(agent);
         }
         self.agents.deinit(self.allocator);
@@ -257,13 +280,13 @@ pub const Runtime = struct {
         else
             self.createAgent() catch return .{ .err = error.OutOfMemory };
 
-        const request_id = agent.allocateRequestId();
-        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .request_id = request_id } }) catch
+        const trigger_id = agent.trigger_ids.allocate();
+        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .trigger_id = trigger_id } }) catch
             return .{ .err = error.OutOfMemory };
-        loop.debugLog("submit_query agent={d} request={d}", .{ agent.id, request_id });
+        loop.debugLog("submit_query agent={d} trigger={d}", .{ agent.id, trigger_id });
 
-        agent.enqueueSignal(self.allocator, .{ .request = .{
-            .id = request_id,
+        agent.enqueueMail(self.allocator, .{ .request = .{
+            .id = trigger_id,
             .text = msg.text.?,
             .priority = msg.priority,
         } }) catch {
@@ -272,16 +295,16 @@ pub const Runtime = struct {
         };
         msg.text = null;
 
-        return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = agent.id, .request_id = request_id } };
+        return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = agent.id, .trigger_id = trigger_id } };
     }
 
     fn handleSubmitReply(self: *Runtime, msg: *@FieldType(InboxItem.Msg, "submit_reply")) InboxItem.Result {
         const agent = self.getAgent(msg.agent_id) orelse return .{ .err = error.UnknownAgent };
-        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .request_id = null } }) catch
+        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .trigger_id = null } }) catch
             return .{ .err = error.OutOfMemory };
         loop.debugLog("submit_reply agent={d} syscall={d}", .{ msg.agent_id, msg.syscall_id });
 
-        agent.enqueueSignal(self.allocator, .{ .tool_done = .{
+        agent.enqueueMail(self.allocator, .{ .tool_done = .{
             .syscall_id = msg.syscall_id,
             .output = msg.text.?,
             .ok = true,
@@ -292,21 +315,22 @@ pub const Runtime = struct {
         };
         msg.text = null;
 
-        return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = msg.agent_id, .request_id = null } };
+        return .{ .ok = .{ .accepted_seq = accepted_seq, .agent_id = msg.agent_id, .trigger_id = null } };
     }
 
     fn handleCancelAgent(self: *Runtime, msg: @FieldType(InboxItem.Msg, "cancel_agent")) InboxItem.Result {
         const agent = self.getAgent(msg.agent_id) orelse return .{ .cancel_err = error.UnknownAgent };
         loop.debugLog("cancel agent={d}", .{msg.agent_id});
 
-        agent.enqueueSignal(self.allocator, .cancel) catch {};
+        // Signal the agent's signal receiver thread to cancel the event loop.
+        agent.cancel_event.set(self.io);
 
         return .{ .cancel_ok = .{ .accepted_seq = self.event_log.peekNextSeq(), .agent_id = msg.agent_id } };
     }
 
     fn dispatchToolDone(self: *Runtime, msg: @FieldType(InboxItem.Msg, "tool_done")) bool {
         const agent = self.getAgent(msg.agent_id) orelse return false;
-        agent.enqueueSignal(self.allocator, .{ .tool_done = .{
+        agent.enqueueMail(self.allocator, .{ .tool_done = .{
             .syscall_id = msg.syscall_id,
             .output = msg.output.?,
             .ok = msg.ok,
@@ -319,22 +343,21 @@ pub const Runtime = struct {
         const agent = try self.allocator.create(Agent);
         errdefer self.allocator.destroy(agent);
         agent.* = .{
-            .id = self.next_agent_id,
+            .id = self.agent_ids.allocate(),
             .allocator = self.allocator,
             .client = self.client,
             .max_turns = self.config.max_turns,
             .tools_json = self.config.tools_json,
             .kernel = self.kernelServices(),
         };
-        errdefer agent.deinit(self.allocator);
-        self.next_agent_id += 1;
+        errdefer agent.deinit();
         try agent.appendSystemPrompt(self.config.system_prompt);
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.agents.put(self.allocator, agent.id, agent);
 
-        self.worker_group.concurrent(self.io, Agent.main, .{agent}) catch |err| {
+        self.agent_group.concurrent(self.io, Agent.main, .{agent}) catch |err| {
             _ = self.agents.fetchSwapRemove(agent.id);
             return err;
         };
@@ -354,6 +377,7 @@ pub const Runtime = struct {
             .emitEventFn = emitEventThunk,
             .startToolFn = startToolThunk,
             .spawnToolWorkerFn = spawnToolWorkerThunk,
+            .cancelToolFn = cancelToolThunk,
             .isShutdownFn = isShutdownThunk,
         };
     }
@@ -370,7 +394,14 @@ pub const Runtime = struct {
 
     fn spawnToolWorkerThunk(ctx: *anyopaque, agent_id: loop.AgentId, syscall_id: loop.SyscallId, job: loop.ToolJob, detached: bool) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.spawnToolWorker(agent_id, syscall_id, job, detached);
+        self.spawnToolWorker(agent_id, syscall_id, job, detached) catch {
+            self.sendToolFailure(agent_id, syscall_id, detached);
+        };
+    }
+
+    fn cancelToolThunk(ctx: *anyopaque, syscall_id: loop.SyscallId) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        self.cancelToolWorker(syscall_id);
     }
 
     fn isShutdownThunk(ctx: *anyopaque) bool {
@@ -394,13 +425,16 @@ pub const Runtime = struct {
         }
     };
 
-    fn spawnToolWorker(self: *Runtime, agent_id: loop.AgentId, syscall_id: loop.SyscallId, job: loop.ToolJob, detached: bool) void {
+    fn spawnToolWorker(self: *Runtime, agent_id: loop.AgentId, syscall_id: loop.SyscallId, job: loop.ToolJob, detached: bool) !void {
         loop.debugLog("spawn_tool_worker agent={d} syscall={d} detached={}", .{ agent_id, syscall_id, detached });
-        const ctx = self.allocator.create(ToolWorkerCtx) catch {
+
+        const ctx = self.allocator.create(ToolWorkerCtx) catch |err| {
             job.deinit(self.allocator);
-            self.sendToolFailure(agent_id, syscall_id, detached);
-            return;
+            return err;
         };
+        // job has been moved into ctx, so we must ensure ctx is deinitialized on any error path from this point on.
+        errdefer ctx.deinit();
+
         ctx.* = .{
             .runtime = self,
             .allocator = self.allocator,
@@ -409,22 +443,42 @@ pub const Runtime = struct {
             .job = job,
             .detached = detached,
         };
-        self.worker_group.concurrent(self.io, toolWorkerMain, .{ctx}) catch {
-            ctx.deinit();
-            self.sendToolFailure(agent_id, syscall_id, detached);
-            return;
+
+        // Spawn tool on its own Future for individual cancellation.
+        const entry = try self.allocator.create(ToolFutureEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{
+            .future = try self.io.concurrent(toolWorkerMain, .{ctx}),
+            .agent_id = agent_id,
+        };
+
+        // Past this point, ctx ownership has been transferred to the worker thread
+        // (toolWorkerMain defers ctx.deinit()). No `try` below, so the errdefers above
+        // will not fire on the normal return path.
+
+        self.tool_futures_mutex.lockUncancelable(self.io);
+        defer self.tool_futures_mutex.unlock(self.io);
+        self.tool_futures.put(self.allocator, syscall_id, entry) catch |err| {
+            // Future is already spawned; we just can't track it for cancellation.
+            // The tool will still run and deliver results.
+            // FIXME: or should it? Without being able to track the Future, we won't be able to cancel it on shutdown,
+            // which could lead to memory leaks if the tool allocates memory and never finishes. Maybe we should kill the process in this case?
+            loop.debugLog("spawn_tool_worker syscall={d} failed to track future: {s}", .{ syscall_id, @errorName(err) });
+            self.allocator.destroy(entry);
         };
     }
 
-    fn toolWorkerMain(ctx: *ToolWorkerCtx) std.Io.Cancelable!void {
+    fn toolWorkerMain(ctx: *ToolWorkerCtx) void {
         defer ctx.deinit();
 
         var ok = true;
         loop.debugLog("tool_worker_main agent={d} syscall={d}", .{ ctx.agent_id, ctx.syscall_id });
-        const output = ctx.job.run(ctx.allocator) catch |err| blk: {
+        const output = ctx.job.run(ctx.allocator, ctx.runtime.io) catch |err| blk: {
             ok = false;
+            loop.debugLog("tool_worker_main agent={d} syscall={d} failed: {s}", .{ ctx.agent_id, ctx.syscall_id, @errorName(err) });
             break :blk std.fmt.allocPrint(ctx.allocator, "tool worker failed: {s}", .{@errorName(err)}) catch return;
         };
+        loop.debugLog("tool_worker_main agent={d} syscall={d} done ok={}", .{ ctx.agent_id, ctx.syscall_id, ok });
 
         ctx.runtime.enqueueToolDone(.{
             .agent_id = ctx.agent_id,
@@ -433,6 +487,31 @@ pub const Runtime = struct {
             .ok = ok,
             .detached = ctx.detached,
         });
+    }
+
+    fn cancelToolWorker(self: *Runtime, syscall_id: loop.SyscallId) void {
+        loop.debugLog("cancelToolWorker syscall={d} looking up future", .{syscall_id});
+        self.tool_futures_mutex.lockUncancelable(self.io);
+        const entry_kv = self.tool_futures.fetchSwapRemove(syscall_id);
+        self.tool_futures_mutex.unlock(self.io);
+
+        if (entry_kv) |kv| {
+            const entry = kv.value;
+            loop.debugLog("cancelToolWorker syscall={d} cancelling future", .{syscall_id});
+            // future.cancel blocks until the tool worker finishes.
+            _ = entry.future.cancel(self.io);
+            loop.debugLog("cancelToolWorker syscall={d} future cancelled", .{syscall_id});
+
+            // Emit tool_cancelled event.
+            _ = self.event_log.append(.{ .tool_cancelled = .{
+                .agent_id = entry.agent_id,
+                .syscall_id = syscall_id,
+            } }) catch {};
+
+            self.allocator.destroy(entry);
+        } else {
+            loop.debugLog("cancelToolWorker syscall={d} no future found (already finished?)", .{syscall_id});
+        }
     }
 
     fn enqueueToolDone(self: *Runtime, msg: @FieldType(InboxItem.Msg, "tool_done")) void {
@@ -457,7 +536,7 @@ pub const Runtime = struct {
     fn sendToolFailure(self: *Runtime, agent_id: loop.AgentId, syscall_id: loop.SyscallId, detached: bool) void {
         const agent = self.getAgent(agent_id) orelse return;
         const output = self.allocator.dupe(u8, "[tool worker failed to spawn]") catch {
-            agent.enqueueSignal(self.allocator, .{ .tool_done = .{
+            agent.enqueueMail(self.allocator, .{ .tool_done = .{
                 .syscall_id = syscall_id,
                 .output = &.{},
                 .ok = false,
@@ -465,7 +544,7 @@ pub const Runtime = struct {
             } }) catch {};
             return;
         };
-        agent.enqueueSignal(self.allocator, .{ .tool_done = .{
+        agent.enqueueMail(self.allocator, .{ .tool_done = .{
             .syscall_id = syscall_id,
             .output = output,
             .ok = false,

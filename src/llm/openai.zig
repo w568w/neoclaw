@@ -119,7 +119,12 @@ pub const Client = struct {
 
         const uri = try std.Uri.parse(endpoint);
         var req = try self.http_client.request(.POST, uri, .{ .extra_headers = &headers });
-        errdefer req.deinit();
+        errdefer {
+            // FIXME: Workaround for the case that sometimes the connection is cancelled during receiving head, and closing=false still holds,
+            // thus the connection is allowed for reusing in conn pool, which makes a subsequent request get response to the previous request.
+            if (req.connection) |conn| conn.closing = true;
+            req.deinit();
+        }
 
         const payload = request_body_writer.written();
         req.transfer_encoding = .{ .content_length = payload.len };
@@ -203,6 +208,12 @@ pub const ChatStream = struct {
         self.tool_builders.deinit(self.allocator);
         self.request.deinit();
         self.* = undefined;
+    }
+
+    /// Returns the content accumulated so far from stream chunks.
+    /// Borrowed view, valid until the next stream read or deinit.
+    pub fn contentSoFar(self: *const ChatStream) []const u8 {
+        return self.content_builder.items;
     }
 
     fn getReader(self: *ChatStream) *std.Io.Reader {

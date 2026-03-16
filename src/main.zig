@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
         const receipt = try runtime.submitQuery(current_agent_id, trimmed, .interactive);
         current_agent_id = receipt.agent_id;
 
-        try consumeUntilFinished(allocator, &editor, stdout, &runtime, &sub, current_agent_id.?, receipt.request_id);
+        try consumeUntilFinished(allocator, &editor, stdout, &runtime, &sub, current_agent_id.?, receipt.trigger_id);
     }
 
     try stdout.writeAll("bye\n");
@@ -104,7 +104,7 @@ fn consumeUntilFinished(
     runtime: *neoclaw.loop.Runtime,
     sub: *neoclaw.loop.Subscription,
     agent_id: neoclaw.loop.AgentId,
-    request_id: ?neoclaw.loop.RequestId,
+    trigger_id: ?neoclaw.loop.TriggerId,
 ) !void {
     var saw_delta = false;
 
@@ -114,7 +114,7 @@ fn consumeUntilFinished(
         switch (record.event) {
             .accepted => {},
             .started => |ev| {
-                if (ev.agent_id == agent_id and ev.request_id == request_id) {
+                if (ev.agent_id == agent_id and ev.trigger_id == trigger_id) {
                     try stdout.print("[started][agent {d}]\n", .{ev.agent_id});
                     try stdout.flush();
                 }
@@ -169,9 +169,23 @@ fn consumeUntilFinished(
                 const reply_trimmed = std.mem.trim(u8, reply, " \t\r\n");
                 _ = try runtime.submitReply(agent_id, ev.syscall_id, reply_trimmed);
             },
+            .message_incomplete => |ev| {
+                if (ev.agent_id != agent_id) continue;
+                if (saw_delta) {
+                    try stdout.writeAll("\n");
+                    saw_delta = false;
+                }
+                try stdout.print("[incomplete] {s}\n", .{ev.partial_content});
+                try stdout.flush();
+            },
+            .tool_cancelled => |ev| {
+                if (ev.agent_id != agent_id) continue;
+                try stdout.print("[tool-cancelled][syscall {d}]\n", .{ev.syscall_id});
+                try stdout.flush();
+            },
             .finished => |ev| {
                 if (ev.agent_id != agent_id) continue;
-                if (ev.request_id != request_id) continue;
+                if (ev.trigger_id != trigger_id) continue;
                 if (!saw_delta and ev.final_text.len > 0) {
                     try stdout.print("assistant> {s}", .{ev.final_text});
                 }

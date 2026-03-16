@@ -44,7 +44,7 @@ pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Alloca
     } } };
 }
 
-fn runJob(ptr: *anyopaque, allocator: std.mem.Allocator) ![]const u8 {
+fn runJob(ptr: *anyopaque, allocator: std.mem.Allocator, _: std.Io) ![]const u8 {
     const job: *Job = @ptrCast(@alignCast(ptr));
 
     const ext = switch (job.code_type) {
