@@ -5,6 +5,7 @@ const neoclaw = @import("neoclaw");
 const dotenv = @import("dotenv.zig");
 const cacert = @import("generated/cacert.zig");
 const LineEditor = @import("line_editor/editor.zig").LineEditor;
+const Terminal = @import("line_editor/terminal.zig").Terminal;
 
 const SystemPromptFile = "NEOCLAW.md";
 const MaxTurns: u32 = 40;
@@ -106,6 +107,10 @@ fn consumeUntilFinished(
     agent_id: neoclaw.loop.AgentId,
     trigger_id: ?neoclaw.loop.TriggerId,
 ) !void {
+    const io = runtime.io;
+    var signal_future = startSignalListener(io, runtime, agent_id);
+    defer stopSignalListener(io, &signal_future);
+
     var saw_delta = false;
 
     while (try runtime.event_log.recv(sub)) |record_const| {
@@ -161,6 +166,9 @@ fn consumeUntilFinished(
                 try stdout.print("assistant> [ASK] {s}\n", .{ev.question});
                 try stdout.flush();
 
+                stopSignalListener(io, &signal_future);
+                defer signal_future = startSignalListener(io, runtime, agent_id);
+
                 const reply_opt = try editor.readLine("reply> ");
                 if (reply_opt == null) return;
                 const reply = reply_opt.?;
@@ -203,6 +211,39 @@ fn consumeUntilFinished(
                 try stdout.flush();
             },
         }
+    }
+}
+
+const SignalFuture = Io.Future(void);
+
+fn signalListener(runtime: *neoclaw.loop.Runtime, agent_id: neoclaw.loop.AgentId) void {
+    const io = runtime.io;
+    var terminal: Terminal = .{};
+    const raw_ok = terminal.enableRawMode() catch return;
+    if (!raw_ok) return;
+    defer terminal.disableRawMode();
+
+    var buf: [16]u8 = undefined;
+    var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &buf);
+    const reader = &stdin_reader.interface;
+
+    while (true) {
+        const byte_ptr = reader.takeArray(1) catch return;
+        if (byte_ptr[0] == 3) {
+            _ = runtime.cancelAgent(agent_id) catch {};
+            return;
+        }
+    }
+}
+
+fn startSignalListener(io: Io, runtime: *neoclaw.loop.Runtime, agent_id: neoclaw.loop.AgentId) ?SignalFuture {
+    return io.concurrent(signalListener, .{ runtime, agent_id }) catch null;
+}
+
+fn stopSignalListener(io: Io, future: *?SignalFuture) void {
+    if (future.*) |*f| {
+        _ = f.cancel(io);
+        future.* = null;
     }
 }
 
