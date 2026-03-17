@@ -72,8 +72,8 @@ pub const Runtime = struct {
     config: loop.RuntimeConfig,
 
     // -- Kernel synchronization --
-    // Protects `inbox`, `agents`, `shutdown`, `agent_ids`, and `tool_futures`.
-    // Lock ordering: Runtime.mutex -> Agent.mail_mutex -> InboxItem.mutex.
+    // Protects `inbox`, `agents`, `shutdown`, and `agent_ids`.
+    // Lock ordering: Runtime.mutex -> Agent.mailbox.mutex -> InboxItem.mutex.
     mutex: Io.Mutex = .init,
     inbox_cond: Io.Condition = .init,
     runtime_thread: ?std.Thread = null,
@@ -88,6 +88,8 @@ pub const Runtime = struct {
 
     // -- Tool future tracking --
     // Each tool worker gets an individual Future so it can be cancelled independently.
+    // Guarded by its own mutex to avoid holding `mutex` during potentially
+    // blocking future.cancel() calls in cancelToolWorker.
     tool_futures: std.AutoArrayHashMapUnmanaged(loop.SyscallId, *ToolFutureEntry) = .empty,
     tool_futures_mutex: Io.Mutex = .init,
 

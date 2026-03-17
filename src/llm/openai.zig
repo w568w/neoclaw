@@ -181,11 +181,16 @@ pub const ChatStream = struct {
     tool_builders: std.ArrayList(ToolCallBuilder) = .empty,
 
     delta_buffer: std.ArrayList(u8) = .empty,
-    emitted_finished: bool = false,
-    seen_done_marker: bool = false,
-    closed: bool = false,
-    response_taken: bool = false,
+    state: State = .streaming,
     json_scratch: [65536]u8 = undefined,
+
+    const State = enum {
+        streaming,
+        /// Stream ended; next() has returned .finished. Ready for takeResponseOwned().
+        finished,
+        /// takeResponseOwned() has been called; no further operations are valid.
+        taken,
+    };
 
     const ToolCallBuilder = struct {
         id: std.ArrayList(u8) = .empty,
@@ -225,26 +230,13 @@ pub const ChatStream = struct {
 
     /// Returns borrowed event data valid until next `next` call.
     pub fn next(self: *ChatStream) !?ChatDeltaEvent {
-        if (self.closed) return null;
+        if (self.state != .streaming) return null;
 
         while (true) {
-            if (self.seen_done_marker) {
-                self.closed = true;
-                if (!self.emitted_finished) {
-                    self.emitted_finished = true;
-                    return .finished;
-                }
-                return null;
-            }
-
             const line_opt = try self.getReader().takeDelimiter('\n');
             if (line_opt == null) {
-                self.closed = true;
-                if (!self.emitted_finished) {
-                    self.emitted_finished = true;
-                    return .finished;
-                }
-                return null;
+                self.state = .finished;
+                return .finished;
             }
 
             const line = std.mem.trimEnd(u8, line_opt.?, "\r");
@@ -253,8 +245,8 @@ pub const ChatStream = struct {
 
             const payload = std.mem.trimStart(u8, line[5..], " ");
             if (std.mem.eql(u8, payload, "[DONE]")) {
-                self.seen_done_marker = true;
-                continue;
+                self.state = .finished;
+                return .finished;
             }
 
             if (try self.consumeChunk(payload)) |delta| return .{ .content_delta = delta };
@@ -263,8 +255,11 @@ pub const ChatStream = struct {
 
     /// Returns owned response assembled from stream chunks.
     pub fn takeResponseOwned(self: *ChatStream) !ChatResponse {
-        if (!self.closed) return Client.Error.StreamNotFinished;
-        if (self.response_taken) return Client.Error.StreamAlreadyTaken;
+        switch (self.state) {
+            .streaming => return Client.Error.StreamNotFinished,
+            .taken => return Client.Error.StreamAlreadyTaken,
+            .finished => {},
+        }
 
         const content = try self.content_builder.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(content);
@@ -286,7 +281,7 @@ pub const ChatStream = struct {
             filled = i + 1;
         }
 
-        self.response_taken = true;
+        self.state = .taken;
         return .{ .content = content, .finish_reason = finish_reason, .tool_calls = tool_calls };
     }
 
