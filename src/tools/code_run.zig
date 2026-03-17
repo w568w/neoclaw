@@ -15,14 +15,13 @@ pub const Params = struct {
 };
 
 const Job = struct {
-    io: std.Io,
     code_type: @FieldType(Params, "type"),
     code: []const u8,
     timeout: u32,
     cwd: ?[]const u8,
 };
 
-pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.ToolStartResult {
+pub fn start(_: *schema.ToolContext, params: Params, allocator: std.mem.Allocator) !loop.ToolStartResult {
     const code = try allocator.dupe(u8, params.code);
     errdefer allocator.free(code);
     const cwd = if (params.cwd) |c| try allocator.dupe(u8, c) else null;
@@ -30,7 +29,6 @@ pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Alloca
 
     const job = try allocator.create(Job);
     job.* = .{
-        .io = ctx.io,
         .code_type = params.type,
         .code = code,
         .timeout = params.timeout,
@@ -44,7 +42,7 @@ pub fn start(ctx: *schema.ToolContext, params: Params, allocator: std.mem.Alloca
     } } };
 }
 
-fn runJob(ptr: *anyopaque, allocator: std.mem.Allocator, _: std.Io) ![]const u8 {
+fn runJob(ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const job: *Job = @ptrCast(@alignCast(ptr));
 
     const ext = switch (job.code_type) {
@@ -59,8 +57,8 @@ fn runJob(ptr: *anyopaque, allocator: std.mem.Allocator, _: std.Io) ![]const u8 
     const base_dir = job.cwd orelse ".";
     const temp_path = try std.fs.path.resolve(allocator, &.{ base_dir, temp_name });
     defer allocator.free(temp_path);
-    try std.Io.Dir.cwd().writeFile(job.io, .{ .sub_path = temp_path, .data = job.code, .flags = .{ .truncate = true } });
-    defer std.Io.Dir.cwd().deleteFile(job.io, temp_path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_path, .data = job.code, .flags = .{ .truncate = true } });
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const argv = switch (job.code_type) {
         .python => [_][]const u8{ "python3", temp_path },
@@ -70,9 +68,9 @@ fn runJob(ptr: *anyopaque, allocator: std.mem.Allocator, _: std.Io) ![]const u8 
     const timeout = (std.Io.Timeout{ .duration = .{
         .raw = std.Io.Duration.fromSeconds(@intCast(job.timeout)),
         .clock = .awake,
-    } }).toDeadline(job.io);
+    } }).toDeadline(io);
 
-    const result = try std.process.run(allocator, job.io, .{
+    const result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .cwd = if (job.cwd) |cwd| .{ .path = cwd } else .inherit,
         .timeout = timeout,
