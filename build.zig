@@ -33,6 +33,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const clap = b.dependency("clap", .{});
+
     const exe = b.addExecutable(.{
         .name = "neoclaw",
         .root_module = b.createModule(.{
@@ -41,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "neoclaw", .module = mod },
+                .{ .name = "clap", .module = clap.module("clap") },
             },
         }),
     });

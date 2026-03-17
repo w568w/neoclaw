@@ -12,3 +12,4 @@ pub const tools = struct {
     pub const file_write = @import("tools/file_write.zig");
     pub const ask_user = @import("tools/ask_user.zig");
 };
+pub const webui = @import("webui/server.zig");

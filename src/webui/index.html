@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>neoclaw</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="top-bar">
+    <span class="logo">neoclaw</span>
+    <span id="status" class="status disconnected">disconnected</span>
+    <button id="btn-cancel" class="btn-cancel" disabled>Cancel</button>
+  </header>
+  <main id="messages"></main>
+  <footer id="input-bar">
+    <textarea id="input" rows="1" placeholder="Type a message..." autofocus></textarea>
+    <button id="btn-send">Send</button>
+  </footer>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

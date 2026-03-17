@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const clap = @import("clap");
 const Io = std.Io;
 
 const neoclaw = @import("neoclaw");
@@ -6,9 +8,11 @@ const dotenv = @import("dotenv.zig");
 const cacert = @import("generated/cacert.zig");
 const LineEditor = @import("line_editor/editor.zig").LineEditor;
 const Terminal = @import("line_editor/terminal.zig").Terminal;
+const WebServer = neoclaw.webui.WebServer;
 
 const SystemPromptFile = "NEOCLAW.md";
 const MaxTurns: u32 = 40;
+const DefaultWebUIPort: u16 = 3120;
 
 const ToolRegistry = neoclaw.schema.Registry(.{
     neoclaw.tools.code_run,
@@ -17,7 +21,47 @@ const ToolRegistry = neoclaw.schema.Registry(.{
     neoclaw.tools.ask_user,
 });
 
+const RunMode = enum { cli, webui };
+
+const CliOptions = struct {
+    mode: RunMode = .cli,
+    port: u16 = DefaultWebUIPort,
+};
+
+const cli_params = clap.parseParamsComptime(
+    \\-h, --help       Display this help and exit.
+    \\-p, --port <u16> WebUI port (default: 3120).
+    \\    --webui      Run in WebUI mode instead of CLI.
+    \\
+);
+
+fn parseArgs(args: std.process.Args, io: Io) CliOptions {
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parse(clap.Help, &cli_params, clap.parsers.default, args, .{
+        .diagnostic = &diag,
+        .allocator = std.heap.smp_allocator,
+    }) catch |err| {
+        diag.reportToFile(io, .stderr(), err) catch {};
+        std.process.exit(1);
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0) {
+        clap.helpToFile(io, .stdout(), clap.Help, &cli_params, .{}) catch {};
+        std.process.exit(0);
+    }
+
+    return .{
+        .mode = if (res.args.webui != 0) .webui else .cli,
+        .port = res.args.port orelse DefaultWebUIPort,
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
+    // Ctrl-C is handled via raw mode stdin (byte 0x03), not SIGINT.
+    // Ignore SIGINT to prevent unclean termination during shutdown.
+    ignoreSigint();
+
     const allocator = std.heap.smp_allocator;
     const io = init.io;
 
@@ -25,8 +69,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
-    var editor = LineEditor.init(allocator);
-    defer editor.deinit();
+    const opts = parseArgs(init.minimal.args, io);
 
     try dotenv.loadInto(allocator, init.environ_map, init.io);
 
@@ -62,6 +105,51 @@ pub fn main(init: std.process.Init) !void {
     try runtime.start();
     defer runtime.deinit();
 
+    switch (opts.mode) {
+        .webui => try runWebUI(allocator, io, stdout, &runtime, opts.port),
+        .cli => try runCli(allocator, stdout, &runtime),
+    }
+}
+
+fn runWebUI(allocator: std.mem.Allocator, io: Io, stdout: *Io.Writer, runtime: *neoclaw.loop.Runtime, port: u16) !void {
+    var web_server = WebServer.init(allocator, io, runtime, port);
+    defer web_server.deinit();
+    try web_server.start();
+
+    try stdout.print("neoclaw webui running on http://localhost:{d}\n", .{port});
+    try stdout.print("press Ctrl-C to stop\n", .{});
+    try stdout.flush();
+
+    // Main task blocks on stdin in raw mode, waiting for Ctrl-C.
+    waitForCtrlC(io);
+}
+
+fn waitForCtrlC(io: Io) void {
+    var terminal: Terminal = .{};
+    const raw_ok = terminal.enableRawMode() catch false;
+    if (!raw_ok) {
+        // stdin is not a terminal (e.g. pipe, background process).
+        // Block forever; the process can only be stopped by SIGTERM.
+        var buf: [16]u8 = undefined;
+        var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &buf);
+        _ = stdin_reader.interface.takeArray(1) catch {};
+        return;
+    }
+    defer terminal.disableRawMode();
+
+    var buf: [16]u8 = undefined;
+    var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &buf);
+    const reader = &stdin_reader.interface;
+    while (true) {
+        const byte_ptr = reader.takeArray(1) catch return;
+        if (byte_ptr[0] == 3) return; // Ctrl-C
+    }
+}
+
+fn runCli(allocator: std.mem.Allocator, stdout: *Io.Writer, runtime: *neoclaw.loop.Runtime) !void {
+    var editor = LineEditor.init(allocator);
+    defer editor.deinit();
+
     var sub = runtime.event_log.subscribe(.tail);
     var current_agent_id: ?neoclaw.loop.AgentId = null;
 
@@ -91,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
         const receipt = try runtime.submitQuery(current_agent_id, trimmed, .interactive);
         current_agent_id = receipt.agent_id;
 
-        try consumeUntilFinished(allocator, &editor, stdout, &runtime, &sub, current_agent_id.?, receipt.trigger_id);
+        try consumeUntilFinished(allocator, &editor, stdout, runtime, &sub, current_agent_id.?, receipt.trigger_id);
     }
 
     try stdout.writeAll("bye\n");
@@ -269,4 +357,16 @@ fn getEnvOwned(
     if (environ_map.get(name)) |value| return allocator.dupe(u8, value);
     if (default_value) |v| return allocator.dupe(u8, v);
     return error.MissingEnvironmentVariable;
+}
+
+fn ignoreSigint() void {
+    if (comptime builtin.os.tag == .linux) {
+        const posix = std.posix;
+        const act: std.os.linux.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = std.os.linux.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.INT, &act, null);
+    }
 }

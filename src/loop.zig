@@ -351,12 +351,14 @@ pub const EventLog = struct {
         } };
     }
 
+    /// Receives the next event for a subscription, blocking until an event is available.
+    /// This method is cancelable.
     pub fn recv(self: *EventLog, sub: *Subscription) !?EventRecord {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         while (sub.next_seq >= self.seqs.next and !self.shutdown) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
+            try self.cond.wait(self.io, &self.mutex);
         }
 
         if (sub.next_seq >= self.seqs.next and self.shutdown) return null;
