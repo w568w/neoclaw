@@ -139,7 +139,7 @@ pub const Parser = struct {
         const sep = self.peekByte();
         if (sep == '=') {
             self.pos += 1;
-            self.skipHorizSpacesLazy();
+            self.skipHorizSpaces();
         } else if (sep == ':') {
             // Colon requires at least one trailing whitespace
             if (self.pos + 1 >= self.src.len or !isHorizSpace(self.src[self.pos + 1])) {
@@ -283,14 +283,6 @@ pub const Parser = struct {
         }
     }
 
-    /// Lazy variant: skip at most zero horizontal spaces (used after `=` to
-    /// match the JS regex `\s*?` which is lazy). In practice we still need to
-    /// skip spaces before a quoted value's opening quote so that
-    /// `FOO=  "bar"` works. We skip horizontal spaces here.
-    fn skipHorizSpacesLazy(self: *Parser) void {
-        self.skipHorizSpaces();
-    }
-
     fn skipToNextLine(self: *Parser) void {
         while (self.pos < self.src.len and self.src[self.pos] != '\n') {
             self.pos += 1;
@@ -334,10 +326,6 @@ pub const Parser = struct {
 
 const testing = std.testing;
 
-fn collect(src: []const u8) std.StringHashMap([]const u8) {
-    return collectSlice(src);
-}
-
 fn collectSlice(src: []const u8) std.StringHashMap([]const u8) {
     var map = std.StringHashMap([]const u8).init(testing.allocator);
     var parser = Parser.init(src);
@@ -350,13 +338,13 @@ fn collectSlice(src: []const u8) std.StringHashMap([]const u8) {
 // -- Basic key=value --
 
 test "basic key=value" {
-    var m = collect("FOO=bar");
+    var m = collectSlice("FOO=bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "multiple lines" {
-    var m = collect("A=1\nB=2\nC=3\n");
+    var m = collectSlice("A=1\nB=2\nC=3\n");
     defer m.deinit();
     try testing.expectEqualStrings("1", m.get("A").?);
     try testing.expectEqualStrings("2", m.get("B").?);
@@ -366,26 +354,26 @@ test "multiple lines" {
 // -- Comment handling --
 
 test "comment lines" {
-    var m = collect("# this is a comment\nFOO=bar\n# another\n");
+    var m = collectSlice("# this is a comment\nFOO=bar\n# another\n");
     defer m.deinit();
     try testing.expectEqual(@as(usize, 1), m.count());
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "inline comment unquoted" {
-    var m = collect("FOO=bar # comment");
+    var m = collectSlice("FOO=bar # comment");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "hash in unquoted value truncates" {
-    var m = collect("FOO=hello#world");
+    var m = collectSlice("FOO=hello#world");
     defer m.deinit();
     try testing.expectEqualStrings("hello", m.get("FOO").?);
 }
 
 test "hash immediately after equals" {
-    var m = collect("FOO=#bar");
+    var m = collectSlice("FOO=#bar");
     defer m.deinit();
     try testing.expectEqualStrings("", m.get("FOO").?);
 }
@@ -393,25 +381,25 @@ test "hash immediately after equals" {
 // -- Quoting: single quotes --
 
 test "single quoted value" {
-    var m = collect("FOO='hello world'");
+    var m = collectSlice("FOO='hello world'");
     defer m.deinit();
     try testing.expectEqualStrings("hello world", m.get("FOO").?);
 }
 
 test "single quotes preserve backslash-n literally" {
-    var m = collect("FOO='hello\\nworld'");
+    var m = collectSlice("FOO='hello\\nworld'");
     defer m.deinit();
     try testing.expectEqualStrings("hello\\nworld", m.get("FOO").?);
 }
 
 test "single quotes preserve internal spaces" {
-    var m = collect("FOO='  spaced  '");
+    var m = collectSlice("FOO='  spaced  '");
     defer m.deinit();
     try testing.expectEqualStrings("  spaced  ", m.get("FOO").?);
 }
 
 test "single quotes with hash inside" {
-    var m = collect("FOO='hash#here'");
+    var m = collectSlice("FOO='hash#here'");
     defer m.deinit();
     try testing.expectEqualStrings("hash#here", m.get("FOO").?);
 }
@@ -419,37 +407,37 @@ test "single quotes with hash inside" {
 // -- Quoting: double quotes --
 
 test "double quoted value" {
-    var m = collect("FOO=\"hello world\"");
+    var m = collectSlice("FOO=\"hello world\"");
     defer m.deinit();
     try testing.expectEqualStrings("hello world", m.get("FOO").?);
 }
 
 test "double quotes expand backslash-n" {
-    var m = collect("FOO=\"hello\\nworld\"");
+    var m = collectSlice("FOO=\"hello\\nworld\"");
     defer m.deinit();
     try testing.expectEqualStrings("hello\nworld", m.get("FOO").?);
 }
 
 test "double quotes expand backslash-r" {
-    var m = collect("FOO=\"hello\\rworld\"");
+    var m = collectSlice("FOO=\"hello\\rworld\"");
     defer m.deinit();
     try testing.expectEqualStrings("hello\rworld", m.get("FOO").?);
 }
 
 test "double quotes do not expand backslash-t" {
-    var m = collect("FOO=\"hello\\tworld\"");
+    var m = collectSlice("FOO=\"hello\\tworld\"");
     defer m.deinit();
     try testing.expectEqualStrings("hello\\tworld", m.get("FOO").?);
 }
 
 test "double quotes do not expand backslash-backslash" {
-    var m = collect("FOO=\"a\\\\b\"");
+    var m = collectSlice("FOO=\"a\\\\b\"");
     defer m.deinit();
     try testing.expectEqualStrings("a\\\\b", m.get("FOO").?);
 }
 
 test "double quotes with hash inside" {
-    var m = collect("FOO=\"hash#here\" # comment");
+    var m = collectSlice("FOO=\"hash#here\" # comment");
     defer m.deinit();
     try testing.expectEqualStrings("hash#here", m.get("FOO").?);
 }
@@ -457,13 +445,13 @@ test "double quotes with hash inside" {
 // -- Quoting: backtick --
 
 test "backtick quoted value" {
-    var m = collect("FOO=`hello world`");
+    var m = collectSlice("FOO=`hello world`");
     defer m.deinit();
     try testing.expectEqualStrings("hello world", m.get("FOO").?);
 }
 
 test "backtick preserves backslash-n literally" {
-    var m = collect("FOO=`hello\\nworld`");
+    var m = collectSlice("FOO=`hello\\nworld`");
     defer m.deinit();
     try testing.expectEqualStrings("hello\\nworld", m.get("FOO").?);
 }
@@ -471,25 +459,25 @@ test "backtick preserves backslash-n literally" {
 // -- Multiline values --
 
 test "double quoted multiline" {
-    var m = collect("FOO=\"line1\nline2\nline3\"");
+    var m = collectSlice("FOO=\"line1\nline2\nline3\"");
     defer m.deinit();
     try testing.expectEqualStrings("line1\nline2\nline3", m.get("FOO").?);
 }
 
 test "single quoted multiline" {
-    var m = collect("FOO='line1\nline2'");
+    var m = collectSlice("FOO='line1\nline2'");
     defer m.deinit();
     try testing.expectEqualStrings("line1\nline2", m.get("FOO").?);
 }
 
 test "backtick multiline" {
-    var m = collect("FOO=`line1\nline2`");
+    var m = collectSlice("FOO=`line1\nline2`");
     defer m.deinit();
     try testing.expectEqualStrings("line1\nline2", m.get("FOO").?);
 }
 
 test "value after multiline" {
-    var m = collect("A=\"multi\nline\"\nB=after");
+    var m = collectSlice("A=\"multi\nline\"\nB=after");
     defer m.deinit();
     try testing.expectEqualStrings("multi\nline", m.get("A").?);
     try testing.expectEqualStrings("after", m.get("B").?);
@@ -498,37 +486,37 @@ test "value after multiline" {
 // -- Whitespace handling --
 
 test "leading whitespace on line" {
-    var m = collect("  FOO=bar");
+    var m = collectSlice("  FOO=bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "whitespace around equals" {
-    var m = collect("FOO = bar");
+    var m = collectSlice("FOO = bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "trailing whitespace trimmed for unquoted" {
-    var m = collect("FOO=bar   ");
+    var m = collectSlice("FOO=bar   ");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "quoted value preserves internal whitespace" {
-    var m = collect("FOO=\"  bar  \"");
+    var m = collectSlice("FOO=\"  bar  \"");
     defer m.deinit();
     try testing.expectEqualStrings("  bar  ", m.get("FOO").?);
 }
 
 test "whitespace before quoted value" {
-    var m = collect("FOO=  \"bar\"");
+    var m = collectSlice("FOO=  \"bar\"");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "blank lines skipped" {
-    var m = collect("A=1\n\n\nB=2\n");
+    var m = collectSlice("A=1\n\n\nB=2\n");
     defer m.deinit();
     try testing.expectEqual(@as(usize, 2), m.count());
 }
@@ -536,25 +524,25 @@ test "blank lines skipped" {
 // -- Empty values --
 
 test "empty value: key equals nothing" {
-    var m = collect("FOO=");
+    var m = collectSlice("FOO=");
     defer m.deinit();
     try testing.expectEqualStrings("", m.get("FOO").?);
 }
 
 test "empty value: key equals spaces" {
-    var m = collect("FOO=   ");
+    var m = collectSlice("FOO=   ");
     defer m.deinit();
     try testing.expectEqualStrings("", m.get("FOO").?);
 }
 
 test "empty single quotes" {
-    var m = collect("FOO=''");
+    var m = collectSlice("FOO=''");
     defer m.deinit();
     try testing.expectEqualStrings("", m.get("FOO").?);
 }
 
 test "empty double quotes" {
-    var m = collect("FOO=\"\"");
+    var m = collectSlice("FOO=\"\"");
     defer m.deinit();
     try testing.expectEqualStrings("", m.get("FOO").?);
 }
@@ -562,13 +550,13 @@ test "empty double quotes" {
 // -- export prefix --
 
 test "export prefix" {
-    var m = collect("export FOO=bar");
+    var m = collectSlice("export FOO=bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "export with multiple spaces" {
-    var m = collect("export   FOO=bar");
+    var m = collectSlice("export   FOO=bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
@@ -576,13 +564,13 @@ test "export with multiple spaces" {
 // -- Colon separator --
 
 test "colon separator with space" {
-    var m = collect("FOO: bar");
+    var m = collectSlice("FOO: bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
 
 test "colon without space is skipped" {
-    var m = collect("FOO:bar\nBAR=ok");
+    var m = collectSlice("FOO:bar\nBAR=ok");
     defer m.deinit();
     try testing.expect(m.get("FOO") == null);
     try testing.expectEqualStrings("ok", m.get("BAR").?);
@@ -591,19 +579,19 @@ test "colon without space is skipped" {
 // -- Key charset --
 
 test "key with dots and dashes" {
-    var m = collect("my.app-key=val");
+    var m = collectSlice("my.app-key=val");
     defer m.deinit();
     try testing.expectEqualStrings("val", m.get("my.app-key").?);
 }
 
 test "key starting with digit" {
-    var m = collect("123=val");
+    var m = collectSlice("123=val");
     defer m.deinit();
     try testing.expectEqualStrings("val", m.get("123").?);
 }
 
 test "key with invalid chars skipped" {
-    var m = collect("a b=1\nGOOD=2");
+    var m = collectSlice("a b=1\nGOOD=2");
     defer m.deinit();
     try testing.expect(m.get("a b") == null);
     try testing.expectEqualStrings("2", m.get("GOOD").?);
@@ -612,7 +600,7 @@ test "key with invalid chars skipped" {
 // -- Duplicate keys --
 
 test "duplicate keys: last wins" {
-    var m = collect("DUP=one\nDUP=two");
+    var m = collectSlice("DUP=one\nDUP=two");
     defer m.deinit();
     try testing.expectEqualStrings("two", m.get("DUP").?);
 }
@@ -620,14 +608,14 @@ test "duplicate keys: last wins" {
 // -- Malformed lines --
 
 test "no separator skipped" {
-    var m = collect("NOSEP\nGOOD=val");
+    var m = collectSlice("NOSEP\nGOOD=val");
     defer m.deinit();
     try testing.expect(m.get("NOSEP") == null);
     try testing.expectEqualStrings("val", m.get("GOOD").?);
 }
 
 test "equals with no key skipped" {
-    var m = collect("=value\nGOOD=val");
+    var m = collectSlice("=value\nGOOD=val");
     defer m.deinit();
     try testing.expectEqual(@as(usize, 1), m.count());
 }
@@ -635,13 +623,13 @@ test "equals with no key skipped" {
 // -- Escaped quotes inside quoted values --
 
 test "escaped single quote inside single quotes" {
-    var m = collect("FOO='it\\'s here'");
+    var m = collectSlice("FOO='it\\'s here'");
     defer m.deinit();
     try testing.expectEqualStrings("it\\'s here", m.get("FOO").?);
 }
 
 test "escaped double quote inside double quotes" {
-    var m = collect("FOO=\"say\\\"hi\"");
+    var m = collectSlice("FOO=\"say\\\"hi\"");
     defer m.deinit();
     try testing.expectEqualStrings("say\\\"hi", m.get("FOO").?);
 }
@@ -669,7 +657,7 @@ test "standalone cr line endings" {
 // -- BOM handling --
 
 test "utf8 bom at start of file" {
-    var m = collect("\xEF\xBB\xBFFOO=bar");
+    var m = collectSlice("\xEF\xBB\xBFFOO=bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
@@ -677,7 +665,7 @@ test "utf8 bom at start of file" {
 // -- No trailing newline --
 
 test "file without trailing newline" {
-    var m = collect("FOO=bar");
+    var m = collectSlice("FOO=bar");
     defer m.deinit();
     try testing.expectEqualStrings("bar", m.get("FOO").?);
 }
@@ -700,7 +688,7 @@ test "complex mixed scenario" {
         \\SPACED=  hello world  
         \\
     ;
-    var m = collect(src);
+    var m = collectSlice(src);
     defer m.deinit();
     try testing.expectEqualStrings("localhost", m.get("DB_HOST").?);
     try testing.expectEqualStrings("5432", m.get("DB_PORT").?);
@@ -716,7 +704,7 @@ test "complex mixed scenario" {
 test "double backslash then n in double quotes" {
     // `\\n` is three chars: `\`, `\`, `n`. The JS replace(/\\n/g, '\n')
     // sees `\n` starting at index 1, so result is `\` + LF.
-    var m = collect("FOO=\"a\\\\nb\"");
+    var m = collectSlice("FOO=\"a\\\\nb\"");
     defer m.deinit();
     try testing.expectEqualStrings("a\\\nb", m.get("FOO").?);
 }
@@ -766,7 +754,7 @@ test "official fixture: tests/.env" {
         \\USERNAME=therealnerdybeast@example.tld
         \\    SPACED_KEY = parsed
     ;
-    var m = collect(src);
+    var m = collectSlice(src);
     defer m.deinit();
 
     try testing.expectEqualStrings("basic", m.get("BASIC").?);
@@ -852,7 +840,7 @@ test "official fixture: multiline" {
         \\"MULTILINE'S"
         \\STRING`
     ;
-    var m = collect(src);
+    var m = collectSlice(src);
     defer m.deinit();
 
     try testing.expectEqualStrings("basic", m.get("BASIC").?);

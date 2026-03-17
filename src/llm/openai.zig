@@ -274,14 +274,7 @@ pub const ChatStream = struct {
         errdefer self.allocator.free(tool_calls);
 
         var filled: usize = 0;
-        errdefer {
-            var i: usize = 0;
-            while (i < filled) : (i += 1) {
-                self.allocator.free(tool_calls[i].id);
-                self.allocator.free(tool_calls[i].name);
-                self.allocator.free(tool_calls[i].arguments_json);
-            }
-        }
+        errdefer for (tool_calls[0..filled]) |*tc| tc.deinit(self.allocator);
 
         for (self.tool_builders.items, 0..) |*tb, i| {
             const id = try tb.id.toOwnedSlice(self.allocator);
@@ -436,14 +429,7 @@ fn parseChatResponse(allocator: Allocator, body: []const u8) !ChatResponse {
     errdefer allocator.free(tool_calls);
 
     var filled: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < filled) : (i += 1) {
-            allocator.free(tool_calls[i].id);
-            allocator.free(tool_calls[i].name);
-            allocator.free(tool_calls[i].arguments_json);
-        }
-    }
+    errdefer for (tool_calls[0..filled]) |*tc| tc.deinit(allocator);
 
     for (raw_tool_calls, 0..) |raw_tc, i| {
         const id = try allocator.dupe(u8, raw_tc.id);
