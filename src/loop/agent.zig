@@ -39,9 +39,7 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         llm.MessageOwned.freeList(self.allocator, &self.history);
-
-        for (self.mailbox.items.items) |*mail| mail.deinit(self.allocator);
-        self.mailbox.deinit(self.allocator);
+        self.mailbox.deinit(self.kernel.io, self.allocator, loop.Mail.deinit);
 
         self.drainActiveToolIds();
         self.active_tool_ids.deinit(self.allocator);
@@ -56,9 +54,15 @@ pub const Agent = struct {
     }
 
     /// Enqueues a mail into the agent's mailbox. Called by the kernel.
+    /// User requests are prepended (high priority); everything else
+    /// is appended to the tail.
     /// On failure, owned payload within the mail is freed before returning error.
     pub fn enqueueMail(self: *Agent, allocator: Allocator, mail: loop.Mail) Allocator.Error!void {
-        self.mailbox.put(self.kernel.io, allocator, mail) catch {
+        const front = switch (mail) {
+            .request => |req| req.priority == .interactive,
+            .tool_done => false,
+        };
+        (if (front) self.mailbox.putFront(self.kernel.io, allocator, mail) else self.mailbox.put(self.kernel.io, allocator, mail)) catch {
             var m = mail;
             m.deinit(allocator);
             return error.OutOfMemory;
@@ -94,10 +98,12 @@ pub const Agent = struct {
     // -- Event loop --
 
     fn eventLoop(self: *Agent) void {
+        const allocator = self.allocator;
+
         loop.debugLog("eventLoop agent={d} started", .{self.id});
         while (true) {
-            loop.debugLog("eventLoop agent={d} waiting for mails", .{self.id});
-            var batch = self.mailbox.takeBatch(self.kernel.io) catch {
+            loop.debugLog("eventLoop agent={d} waiting for mail", .{self.id});
+            var mail = self.mailbox.take(self.kernel.io, allocator) catch {
                 // error.Canceled: interrupted while idle. No request in progress,
                 // but detach tools may be running.
                 loop.debugLog("eventLoop agent={d} canceled while idle, cleaning up", .{self.id});
@@ -106,129 +112,72 @@ pub const Agent = struct {
                 return;
             };
 
-            const allocator = self.allocator;
-            defer {
-                for (batch.items) |*mail| mail.deinit(allocator);
-                batch.deinit(allocator);
-            }
-
-            // Triage: pick up requests and tool_done events, leaving the rest in the mailbox.
-            // If multiple requests, pick highest-priority one.
-            var request: ?loop.Request = null;
-            var hi_requests: std.ArrayList(loop.Request) = .empty;
-            var lo_requests: std.ArrayList(loop.Request) = .empty;
-            defer {
-                for (hi_requests.items) |*r| r.deinit(allocator);
-                hi_requests.deinit(allocator);
-                for (lo_requests.items) |*r| r.deinit(allocator);
-                lo_requests.deinit(allocator);
-            }
-
+            var trigger_id: ?loop.TriggerId = null;
             var has_update = false;
 
-            for (batch.items) |*mail| {
-                switch (mail.*) {
-                    .request => |*req| {
-                        switch (req.priority) {
-                            .interactive => hi_requests.append(allocator, req.*) catch {
-                                loop.debugLog("eventLoop agent={d} failed to buffer interactive request", .{self.id});
-                                continue;
-                            },
-                            .background => lo_requests.append(allocator, req.*) catch {
-                                loop.debugLog("eventLoop agent={d} failed to buffer background request", .{self.id});
-                                continue;
-                            },
-                        }
-                        // req has been moved into hi_requests/lo_requests, so remove it from req to avoid double free.
-                        _ = req.takeText();
-                    },
-                    .tool_done => |td| {
-                        const kv = self.active_tool_ids.fetchSwapRemove(td.syscall_id) orelse continue; // Skip stale tool_done events.
-                        if (!td.detached) continue; // what? It cannot happen. Ignore just in case.
+            switch (mail) {
+                .request => |*req| {
+                    trigger_id = req.id;
 
-                        // Detached tool completed: emit event to user and append result to history.
-                        _ = self.kernel.emitEvent(.{ .tool_completed = .{
-                            .agent_id = self.id,
-                            .syscall_id = td.syscall_id,
-                            .output = td.output,
-                            .ok = td.ok,
-                        } }) catch {};
-                        if (kv.value) |tool_call_id| { // again, sanity check; should always be present for detached tools.
-                            const content = allocator.dupe(u8, td.output) catch |e| {
-                                allocator.free(tool_call_id);
-                                _ = self.kernel.emitEvent(.{ .fault = .{ .agent_id = self.id, .message = @errorName(e) } }) catch {};
-                                continue;
-                            };
-                            self.history.append(allocator, .{
-                                .role = .tool,
-                                .content = content,
-                                .tool_call_id = tool_call_id,
-                            }) catch |e| {
-                                allocator.free(content);
-                                allocator.free(tool_call_id);
-                                _ = self.kernel.emitEvent(.{ .fault = .{ .agent_id = self.id, .message = @errorName(e) } }) catch {};
-                                continue;
-                            };
-                            has_update = true;
-                        }
-                    },
-                }
-            }
+                    // Append user message to history.
+                    if (req.takeText()) |text| {
+                        const content = allocator.dupe(u8, text) catch |e| {
+                            allocator.free(text);
+                            self.emitErrorAndFinish(req.id, @errorName(e));
+                            continue;
+                        };
+                        allocator.free(text);
+                        self.history.append(allocator, .{ .role = .user, .content = content }) catch |e| {
+                            allocator.free(content);
+                            self.emitErrorAndFinish(req.id, @errorName(e));
+                            continue;
+                        };
+                        has_update = true;
+                    }
+                },
+                .tool_done => |td| {
+                    defer allocator.free(td.output);
+                    const kv = self.active_tool_ids.fetchSwapRemove(td.syscall_id) orelse continue; // Skip stale tool_done events.
+                    if (!td.detached) continue; // what? It cannot happen. Ignore just in case.
 
-            // Pick highest-priority request.
-            if (hi_requests.items.len > 0) {
-                request = hi_requests.orderedRemove(0);
-            } else if (lo_requests.items.len > 0) {
-                request = lo_requests.orderedRemove(0);
-            }
-
-            // Append user message to history (symmetric with detached tool result handling above).
-            if (request) |req| append_user: {
-                const text = req.text orelse break :append_user;
-                const content = allocator.dupe(u8, text) catch |e| {
-                    self.emitErrorAndFinish(req.id, @errorName(e));
-                    break :append_user;
-                };
-                self.history.append(allocator, .{ .role = .user, .content = content }) catch |e| {
-                    allocator.free(content);
-                    self.emitErrorAndFinish(req.id, @errorName(e));
-                    break :append_user;
-                };
-                has_update = true;
+                    // Detached tool completed: emit event to user and append result to history.
+                    _ = self.kernel.emitEvent(.{ .tool_completed = .{
+                        .agent_id = self.id,
+                        .syscall_id = td.syscall_id,
+                        .output = td.output,
+                        .ok = td.ok,
+                    } }) catch {};
+                    if (kv.value) |tool_call_id| { // again, sanity check; should always be present for detached tools.
+                        const content = allocator.dupe(u8, td.output) catch |e| {
+                            allocator.free(tool_call_id);
+                            _ = self.kernel.emitEvent(.{ .fault = .{ .agent_id = self.id, .message = @errorName(e) } }) catch {};
+                            continue;
+                        };
+                        self.history.append(allocator, .{
+                            .role = .tool,
+                            .content = content,
+                            .tool_call_id = tool_call_id,
+                        }) catch |e| {
+                            allocator.free(content);
+                            allocator.free(tool_call_id);
+                            _ = self.kernel.emitEvent(.{ .fault = .{ .agent_id = self.id, .message = @errorName(e) } }) catch {};
+                            continue;
+                        };
+                        has_update = true;
+                    }
+                },
             }
 
             if (!has_update) continue;
 
-            // Put remaining requests back into mailbox (ownership transfer).
-            for (hi_requests.items) |*req| {
-                self.enqueueMail(allocator, .{ .request = .{
-                    .id = req.id,
-                    .text = req.takeText(),
-                    .priority = req.priority,
-                } }) catch {
-                    loop.debugLog("eventLoop agent={d} failed to re-enqueue request", .{self.id});
-                };
-            }
-            for (lo_requests.items) |*req| {
-                self.enqueueMail(allocator, .{ .request = .{
-                    .id = req.id,
-                    .text = req.takeText(),
-                    .priority = req.priority,
-                } }) catch {
-                    loop.debugLog("eventLoop agent={d} failed to re-enqueue request", .{self.id});
-                };
-            }
-
-            const trigger_id = if (request) |r| r.id else self.trigger_ids.allocate();
-            if (request) |*r| r.deinit(allocator);
-
-            self.processUpdate(trigger_id) catch |err| switch (err) {
+            const tid = trigger_id orelse self.trigger_ids.allocate();
+            self.processUpdate(tid) catch |err| switch (err) {
                 error.Canceled => {
                     self.cancelAllActiveTools();
                     self.drainMailbox();
                     return;
                 },
-                else => self.emitErrorAndFinish(trigger_id, @errorName(err)),
+                else => self.emitErrorAndFinish(tid, @errorName(err)),
             };
         }
     }
@@ -238,9 +187,7 @@ pub const Agent = struct {
     // Drains the mailbox, freeing all mails. Make the mailbox empty.
     // Used during cancellation to clean up pending events.
     fn drainMailbox(self: *Agent) void {
-        var batch = self.mailbox.drain(self.kernel.io);
-        for (batch.items) |*mail| mail.deinit(self.allocator);
-        batch.deinit(self.allocator);
+        self.mailbox.removeAll(self.kernel.io, self.allocator, loop.Mail.deinit);
     }
 
     // Frees all active tool IDs and clears the tracking map, so that they will be ignored if their tool_done events arrive later.
@@ -456,60 +403,50 @@ pub const Agent = struct {
         }
 
         while (true) {
-            var batch = try self.mailbox.takeBatch(self.kernel.io); // <- cancellation point
-            defer {
-                for (batch.items) |*mail| mail.deinit(allocator);
-                batch.deinit(allocator);
-            }
+            const mail = try self.mailbox.take(self.kernel.io, allocator); // <- cancellation point
 
-            for (batch.items) |*mail| {
-                switch (mail.*) {
-                    .tool_done => |td| {
-                        const kv = self.active_tool_ids.fetchSwapRemove(td.syscall_id) orelse continue;
+            switch (mail) {
+                .tool_done => |td| {
+                    defer allocator.free(td.output);
 
-                        // 1. If this is the target syscall, return the result and re-enqueue pending user requests.
-                        if (td.syscall_id == target_syscall_id and !td.detached) {
-                            const output = allocator.dupe(u8, td.output) catch
-                                return .{ .output = &.{}, .ok = false };
-                            for (pending_requests.items) |*m| {
-                                self.enqueueMail(allocator, m.*) catch {
-                                    loop.debugLog("waitToolDone agent={d} failed to re-enqueue pending request", .{self.id});
-                                };
-                                m.* = undefined;
-                            }
-                            pending_requests.deinit(allocator);
-                            return .{ .output = output, .ok = td.ok };
+                    // 1. If this is the target syscall, return the result and re-enqueue pending user requests.
+                    if (td.syscall_id == target_syscall_id and !td.detached) {
+                        const output = allocator.dupe(u8, td.output) catch
+                            return .{ .output = &.{}, .ok = false };
+                        _ = self.active_tool_ids.fetchSwapRemove(td.syscall_id);
+                        for (pending_requests.items) |*m| {
+                            self.enqueueMail(allocator, m.*) catch {
+                                loop.debugLog("waitToolDone agent={d} failed to re-enqueue pending request", .{self.id});
+                            };
+                            m.* = undefined;
                         }
-                        // 2. If this is other detached tool, emit event and append to history normally as in event loop.
-                        if (td.detached) {
-                            _ = self.kernel.emitEvent(.{ .tool_completed = .{ .agent_id = self.id, .syscall_id = td.syscall_id, .output = td.output, .ok = td.ok } }) catch {};
-                            if (kv.value) |tool_call_id| {
-                                const content = allocator.dupe(u8, td.output) catch {
-                                    allocator.free(tool_call_id);
-                                    continue;
-                                };
-                                self.history.append(allocator, .{
-                                    .role = .tool,
-                                    .content = content,
-                                    .tool_call_id = tool_call_id,
-                                }) catch {
-                                    allocator.free(content);
-                                    allocator.free(tool_call_id);
-                                };
-                            }
-                        }
-                    },
-                    .request => |*req| {
-                        // 3. Save user requests to buffer temporarily.
-                        if (pending_requests.append(allocator, .{ .request = .{
-                            .id = req.id,
-                            .text = req.text,
-                            .priority = req.priority,
-                        } })) {
-                            _ = req.takeText();
-                        } else |_| {}
-                    },
-                }
+                        pending_requests.deinit(allocator);
+                        return .{ .output = output, .ok = td.ok };
+                    }
+                    // 2. If this is other detached tool, emit event and append to history normally as in event loop.
+                    const kv = self.active_tool_ids.fetchSwapRemove(td.syscall_id) orelse continue;
+                    if (!td.detached) continue; // It cannot happen.
+
+                    _ = self.kernel.emitEvent(.{ .tool_completed = .{ .agent_id = self.id, .syscall_id = td.syscall_id, .output = td.output, .ok = td.ok } }) catch {};
+                    if (kv.value) |tool_call_id| {
+                        const content = allocator.dupe(u8, td.output) catch {
+                            allocator.free(tool_call_id);
+                            continue;
+                        };
+                        self.history.append(allocator, .{
+                            .role = .tool,
+                            .content = content,
+                            .tool_call_id = tool_call_id,
+                        }) catch {
+                            allocator.free(content);
+                            allocator.free(tool_call_id);
+                        };
+                    }
+                },
+                .request => |req| {
+                    // 3. Save user requests to buffer temporarily.
+                    pending_requests.append(allocator, .{ .request = req }) catch {};
+                },
             }
         }
     }
