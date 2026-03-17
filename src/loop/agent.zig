@@ -276,11 +276,13 @@ pub const Agent = struct {
             loop.debugLog("processUpdate agent={d} trigger={d} turn={d}", .{ self.id, trigger_id, turn });
 
             // 1. call LLM
-            var response = self.callLlm(trigger_id) catch |err| switch (err) {
+            var partial_content: ?[]const u8 = null;
+            var response = self.callLlm(trigger_id, &partial_content) catch |err| switch (err) {
                 error.Canceled => {
                     loop.debugLog("processUpdate agent={d} callLlm canceled", .{self.id});
-                    // Append [CANCELED] assistant message to keep history consistent.
-                    const content = allocator.dupe(u8, "[CANCELED]") catch null;
+                    defer if (partial_content) |pc| allocator.free(pc);
+                    const final_text = partial_content orelse "[CANCELED]";
+                    const content = allocator.dupe(u8, final_text) catch null;
                     if (content) |c| {
                         self.history.append(allocator, .{ .role = .assistant, .content = c }) catch {
                             allocator.free(c);
@@ -289,7 +291,7 @@ pub const Agent = struct {
                     _ = self.kernel.emitEvent(.{ .finished = .{
                         .agent_id = self.id,
                         .trigger_id = trigger_id,
-                        .final_text = "[CANCELED]",
+                        .final_text = final_text,
                     } }) catch {};
                     return err;
                 },
@@ -514,7 +516,10 @@ pub const Agent = struct {
 
     /// Calls the LLM with streaming. On cancel, handles cleanup
     /// (including emitting message_incomplete) and returns error.Canceled.
-    fn callLlm(self: *Agent, trigger_id: loop.TriggerId) !openai.ChatResponse {
+    /// If cancelled mid-stream, `partial_content.*` is set to an owned copy
+    /// of the text received so far (caller must free). It stays null when
+    /// cancellation happens before any content arrives.
+    fn callLlm(self: *Agent, trigger_id: loop.TriggerId, partial_content: *?[]const u8) !openai.ChatResponse {
         const allocator = self.allocator;
 
         var message_views: std.ArrayList(llm.MessageView) = .empty;
@@ -551,6 +556,7 @@ pub const Agent = struct {
                             .trigger_id = trigger_id,
                             .partial_content = pc,
                         } }) catch {};
+                        partial_content.* = allocator.dupe(u8, pc) catch null;
                     }
                     return error.Canceled;
                 }
