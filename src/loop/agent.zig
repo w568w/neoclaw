@@ -263,10 +263,12 @@ pub const Agent = struct {
 
             // 2.2. Or if there are tool calls, append assistant message with tool_calls and execute them sequentially.
             loop.debugLog("processUpdate agent={d} LLM returned {d} tool call(s)", .{ self.id, response.tool_calls.len });
+            {
             const assistant_calls = try llm.ToolCall.cloneSlice(allocator, response.tool_calls);
             errdefer llm.ToolCall.freeSlice(allocator, assistant_calls);
             // FIXME: could it have non-null content and tool_calls at the same time?
             try self.history.append(allocator, .{ .role = .assistant, .content = null, .tool_calls = assistant_calls });
+            }
 
             for (response.tool_calls, 0..) |tc, i| {
                 loop.debugLog("processUpdate agent={d} executeSyscall[{d}] tool=\"{s}\"", .{ self.id, i, tc.name });
