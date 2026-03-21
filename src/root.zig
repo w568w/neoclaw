@@ -4,6 +4,7 @@ const Io = std.Io;
 
 pub const llm = @import("llm/mod.zig");
 pub const openai = @import("llm/openai.zig");
+pub const codex = @import("llm/codex.zig");
 pub const loop = @import("loop.zig");
 pub const schema = @import("schema.zig");
 pub const tools = struct {

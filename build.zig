@@ -50,11 +50,31 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const codex_test_exe = b.addExecutable(.{
+        .name = "codex-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/codex_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "neoclaw", .module = mod },
+            },
+        }),
+    });
+
+    b.installArtifact(codex_test_exe);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
+
+    const run_codex_test_step = b.step("run-codex-test", "Run the Codex test client");
+    const run_codex_test_cmd = b.addRunArtifact(codex_test_exe);
+    run_codex_test_step.dependOn(&run_codex_test_cmd.step);
+    run_codex_test_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_codex_test_cmd.addArgs(args);
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
