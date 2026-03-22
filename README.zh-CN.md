@@ -5,6 +5,7 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Status-🚧%20Building-B45309" alt="Under construction">
   <img src="https://img.shields.io/badge/Zig-0.16+-F7A41D?logo=zig&logoColor=white" alt="Zig">
   <img src="https://img.shields.io/badge/Binary-%3C1MB-2C7A7B" alt="Binary under 1MB">
   <img src="https://img.shields.io/badge/Design-Kernel--like-1F3A5F" alt="Kernel-like design">
@@ -17,6 +18,10 @@
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
+
+> 🚧 **Neoclaw 目前仍处于早期开发阶段。**
+>
+> 欢迎提出功能需求、设计意见，以及任何讨论和反馈。
 
 ## 1. 特性
 
