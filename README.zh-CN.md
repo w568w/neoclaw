@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ja.md">日本語</a>
 </p>
 
 > 🚧 **Neoclaw 目前仍处于早期开发阶段。**
