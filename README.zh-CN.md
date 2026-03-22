@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  <img src="assets/webui.png" alt="Neoclaw WebUI" width="900">
+</p>
+
+<p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
