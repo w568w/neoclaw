@@ -1,6 +1,18 @@
-# Neoclaw
+<h1 align="center">Neoclaw</h1>
 
-Another Claw-like agent, but with a different design concept.
+<p align="center">
+  Another Claw-like agent system, but with a different design concept.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Zig-0.16+-F7A41D?logo=zig&logoColor=white" alt="Zig">
+  <img src="https://img.shields.io/badge/Binary-%3C1MB-2C7A7B" alt="Binary under 1MB">
+  <img src="https://img.shields.io/badge/Design-Kernel--like-1F3A5F" alt="Kernel-like design">
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 ## 1. Feature
 
@@ -39,7 +51,7 @@ This is achieved through a combination of careful state management and a robust 
 
 ## 2. Usage
 
-Build:
+Build (Zig main branch):
 
 ```shell
 $ zig build -Doptimize=ReleaseSmall
