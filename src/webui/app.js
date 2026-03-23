@@ -84,7 +84,9 @@
         appendAssistantDelta(msg.text);
         break;
       case "tool_started":
-        addToolCard(msg.syscall_id, msg.name);
+        if (msg.name !== "ask_user") {
+          addToolCard(msg.syscall_id, msg.name, msg.args_json || "{}");
+        }
         break;
       case "tool_waiting":
         updateToolStatus(msg.syscall_id, "running", "waiting...");
@@ -144,7 +146,7 @@
     state.currentAssistantBuf = "";
   }
 
-  function addToolCard(syscallId, name) {
+  function addToolCard(syscallId, name, argsJson) {
     finalizeAssistant();
 
     var details = document.createElement("details");
@@ -167,9 +169,184 @@
     output.id = "tool-output-" + syscallId;
 
     details.appendChild(summary);
+    var argsSpec = formatToolArgs(name, argsJson);
+    if (argsSpec.show) {
+      details.appendChild(renderToolArgs(argsSpec));
+    }
     details.appendChild(output);
     dom.messages.appendChild(details);
     scrollToBottom();
+  }
+
+  function renderToolArgs(spec) {
+    var wrap = document.createElement("div");
+    wrap.className = "tool-args";
+
+    var title = document.createElement("div");
+    title.className = "tool-args-title";
+    title.textContent = "arguments";
+    wrap.appendChild(title);
+
+    if (spec.lines && spec.lines.length > 0) {
+      for (var i = 0; i < spec.lines.length; i++) {
+        var row = document.createElement("div");
+        row.className = "tool-args-row";
+
+        var key = document.createElement("span");
+        key.className = "tool-args-key";
+        key.textContent = spec.lines[i][0];
+
+        var value = document.createElement("span");
+        value.className = "tool-args-value";
+        value.textContent = spec.lines[i][1];
+
+        row.appendChild(key);
+        row.appendChild(value);
+        wrap.appendChild(row);
+      }
+    }
+
+    if (spec.code != null) {
+      var codeBlock = document.createElement("pre");
+      codeBlock.className = "tool-args-code";
+      var code = document.createElement("code");
+      code.textContent = spec.code;
+      codeBlock.appendChild(code);
+      wrap.appendChild(codeBlock);
+    }
+
+    if (spec.text != null) {
+      var text = document.createElement("pre");
+      text.className = "tool-args-text";
+      text.textContent = spec.text;
+      wrap.appendChild(text);
+    }
+
+    return wrap;
+  }
+
+  function formatToolArgs(name, argsJson) {
+    var parsed = null;
+    try {
+      parsed = JSON.parse(argsJson);
+    } catch (e) {}
+
+    if (name === "code_run") {
+      if (!parsed || typeof parsed !== "object") {
+        return { show: true, lines: [], code: argsJson, text: null };
+      }
+      return {
+        show: true,
+        lines: [
+          ["type", asText(parsed.type, "python")],
+          ["timeout", asText(parsed.timeout, 10) + "s"],
+          ["cwd", asText(parsed.cwd, ".")],
+        ],
+        code: asText(parsed.code, ""),
+        text: null,
+      };
+    }
+
+    if (name === "file_read") {
+      return {
+        show: true,
+        lines: [["path", pickField(parsed, "path", "")]],
+        code: null,
+        text: null,
+      };
+    }
+
+    if (name === "file_write") {
+      var content = pickRawField(parsed, "content", "");
+      return {
+        show: true,
+        lines: [
+          ["path", pickField(parsed, "path", "")],
+          ["mode", pickField(parsed, "mode", "overwrite")],
+          ["content_bytes", String(content.length)],
+        ],
+        code: null,
+        text: null,
+      };
+    }
+
+    if (name === "memory_store") {
+      return {
+        show: true,
+        lines: [
+          ["key", pickField(parsed, "key", "")],
+          ["operation", pickField(parsed, "operation", "set")],
+        ],
+        code: null,
+        text: null,
+      };
+    }
+
+    if (name === "memory_recall") {
+      return {
+        show: true,
+        lines: [["query", pickField(parsed, "query", "")]],
+        code: null,
+        text: null,
+      };
+    }
+
+    if (name === "memory_checkpoint") {
+      var info = pickRawField(parsed, "key_info", "");
+      return {
+        show: true,
+        lines: [["key_info_bytes", String(info.length)]],
+        code: null,
+        text: null,
+      };
+    }
+
+    if (name === "ask_user") {
+      return { show: false, lines: [], code: null, text: null };
+    }
+
+    return {
+      show: true,
+      lines: [],
+      code: null,
+      text: stringifyWithLimit(parsed, argsJson, 4096),
+    };
+  }
+
+  function pickRawField(obj, key, fallback) {
+    if (!obj || typeof obj !== "object") return fallback;
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) return fallback;
+    var value = obj[key];
+    if (typeof value === "string") return value;
+    if (value == null) return "";
+    try {
+      return JSON.stringify(value);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function pickField(obj, key, fallback) {
+    return asText(pickRawField(obj, key, fallback), fallback);
+  }
+
+  function asText(value, fallback) {
+    if (value == null) return String(fallback);
+    if (typeof value === "string") return value;
+    return String(value);
+  }
+
+  function stringifyWithLimit(parsed, raw, maxLen) {
+    var text = raw;
+    if (parsed != null) {
+      try {
+        text = JSON.stringify(parsed, null, 2);
+      } catch (e) {
+        text = raw;
+      }
+    }
+    if (text.length <= maxLen) return text;
+    return text.slice(0, maxLen) + "\n... (truncated)";
   }
 
   function updateToolStatus(syscallId, cls, label) {

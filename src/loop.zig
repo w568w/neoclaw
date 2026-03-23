@@ -124,6 +124,7 @@ pub const Event = union(enum) {
         agent_id: AgentId,
         syscall_id: SyscallId,
         name: []const u8,
+        args_json: []const u8,
     },
     tool_waiting: struct {
         agent_id: AgentId,
@@ -169,7 +170,12 @@ pub const Event = union(enum) {
             .accepted => |ev| .{ .accepted = ev },
             .started => |ev| .{ .started = ev },
             .assistant_delta => |ev| .{ .assistant_delta = .{ .agent_id = ev.agent_id, .text = try allocator.dupe(u8, ev.text) } },
-            .tool_started => |ev| .{ .tool_started = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .name = try allocator.dupe(u8, ev.name) } },
+            .tool_started => |ev| .{ .tool_started = .{
+                .agent_id = ev.agent_id,
+                .syscall_id = ev.syscall_id,
+                .name = try allocator.dupe(u8, ev.name),
+                .args_json = try allocator.dupe(u8, ev.args_json),
+            } },
             .tool_waiting => |ev| .{ .tool_waiting = ev },
             .tool_detached => |ev| .{ .tool_detached = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .ack = try allocator.dupe(u8, ev.ack) } },
             .tool_completed => |ev| .{ .tool_completed = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .output = try allocator.dupe(u8, ev.output), .ok = ev.ok } },
@@ -186,7 +192,10 @@ pub const Event = union(enum) {
             .accepted => {},
             .started => {},
             .assistant_delta => |ev| allocator.free(ev.text),
-            .tool_started => |ev| allocator.free(ev.name),
+            .tool_started => |ev| {
+                allocator.free(ev.name);
+                allocator.free(ev.args_json);
+            },
             .tool_waiting => {},
             .tool_detached => |ev| allocator.free(ev.ack),
             .tool_completed => |ev| allocator.free(ev.output),

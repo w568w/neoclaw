@@ -342,7 +342,12 @@ pub const Agent = struct {
         const allocator = self.allocator;
         const syscall_id = self.syscall_ids.allocate();
 
-        _ = try self.kernel.emitEvent(.{ .tool_started = .{ .agent_id = self.id, .syscall_id = syscall_id, .name = tc.name } });
+        _ = try self.kernel.emitEvent(.{ .tool_started = .{
+            .agent_id = self.id,
+            .syscall_id = syscall_id,
+            .name = tc.name,
+            .args_json = tc.arguments_json,
+        } });
 
         const start_result = self.kernel.startTool(tc.name, tc.arguments_json, allocator) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "tool `{s}` failed to start: {s}", .{ tc.name, @errorName(err) });
