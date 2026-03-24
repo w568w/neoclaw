@@ -133,7 +133,7 @@ pub const Client = struct {
         try body.end();
         try req.connection.?.flush();
 
-        var response = try req.receiveHead(&.{});
+        const response = try req.receiveHead(&.{});
         if (response.head.status != .ok) return Error.HttpStatusNotOk;
 
         return .{

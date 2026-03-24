@@ -30,7 +30,7 @@ pub const WebServer = struct {
 
     pub fn start(self: *WebServer) !void {
         const address = try net.IpAddress.parse("0.0.0.0", self.port);
-        self.tcp_server = try net.IpAddress.listen(address, self.io, .{ .reuse_address = true });
+        self.tcp_server = try net.IpAddress.listen(&address, self.io, .{ .reuse_address = true });
         self.accept_future = try self.io.concurrent(acceptLoop, .{self});
     }
 
