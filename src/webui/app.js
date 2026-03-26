@@ -11,6 +11,7 @@
     currentAssistantBuf: "",
     nextClientQueryId: 1,
     queryStatusEls: Object.create(null),
+    askPrompts: Object.create(null),
   };
 
   var dom = {
@@ -108,6 +109,7 @@
         break;
       case "tool_cancelled":
         updateToolStatus(msg.syscall_id, "cancelled", "cancelled");
+        expireAskPrompt(msg.syscall_id, "请求已取消");
         break;
       case "waiting_user":
         addAskPrompt(msg.agent_id, msg.syscall_id, msg.question);
@@ -119,6 +121,7 @@
       case "finished":
         finalizeAssistant();
         setAgentRunning(false);
+        expireAskPromptsByAgent(msg.agent_id, "请求已结束");
         if (msg.client_query_id != null) {
           updateQueryStatus(msg.client_query_id, "done");
         }
@@ -126,6 +129,9 @@
       case "fault":
         addMessage("msg msg-fault", "[fault] " + msg.message);
         setAgentRunning(false);
+        if (msg.agent_id != null) {
+          expireAskPromptsByAgent(msg.agent_id, "请求异常终止");
+        }
         break;
     }
   }
@@ -437,6 +443,10 @@
     dom.messages.appendChild(el);
 
     function submitReply() {
+      var key = String(syscallId);
+      var prompt = state.askPrompts[key];
+      if (!prompt || prompt.status !== "active") return;
+
       var text = inp.value.trim();
       if (!text) return;
       send({ cmd: "reply", agent_id: agentId, syscall_id: syscallId, text: text });
@@ -450,6 +460,9 @@
       replied.textContent = "replied: " + text;
       el.appendChild(q);
       el.appendChild(replied);
+
+      prompt.status = "replied";
+      delete state.askPrompts[key];
     }
 
     btn.onclick = submitReply;
@@ -460,6 +473,38 @@
     };
     inp.focus();
     scrollToBottom();
+
+    state.askPrompts[String(syscallId)] = {
+      el: el,
+      inp: inp,
+      btn: btn,
+      agentId: agentId,
+      status: "active",
+    };
+  }
+
+  function expireAskPrompt(syscallId, reason) {
+    var key = String(syscallId);
+    var prompt = state.askPrompts[key];
+    if (!prompt || prompt.status !== "active") return;
+
+    prompt.status = "expired";
+    prompt.el.classList.add("expired");
+    prompt.inp.disabled = true;
+    prompt.btn.disabled = true;
+    prompt.inp.placeholder = reason;
+    prompt.btn.textContent = "已失效";
+    delete state.askPrompts[key];
+  }
+
+  function expireAskPromptsByAgent(agentId, reason) {
+    if (agentId == null) return;
+    var keys = Object.keys(state.askPrompts);
+    for (var i = 0; i < keys.length; i++) {
+      var prompt = state.askPrompts[keys[i]];
+      if (!prompt || prompt.agentId !== agentId) continue;
+      expireAskPrompt(keys[i], reason);
+    }
   }
 
   // -- Input handling --
@@ -573,6 +618,7 @@
   dom.input.oninput = autoResizeInput;
   dom.btnCancel.onclick = function () {
     if (state.currentAgentId != null) {
+      expireAskPromptsByAgent(state.currentAgentId, "请求已取消");
       send({ cmd: "cancel", agent_id: state.currentAgentId });
     }
   };
