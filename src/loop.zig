@@ -111,10 +111,12 @@ pub const Event = union(enum) {
     accepted: struct {
         agent_id: AgentId,
         trigger_id: ?TriggerId,
+        client_query_id: ?u64,
     },
     started: struct {
         agent_id: AgentId,
         trigger_id: ?TriggerId,
+        client_query_id: ?u64,
     },
     assistant_delta: struct {
         agent_id: AgentId,
@@ -158,6 +160,7 @@ pub const Event = union(enum) {
     finished: struct {
         agent_id: AgentId,
         trigger_id: ?TriggerId,
+        client_query_id: ?u64,
         final_text: []const u8,
     },
     fault: struct {
@@ -182,7 +185,7 @@ pub const Event = union(enum) {
             .waiting_user => |ev| .{ .waiting_user = .{ .agent_id = ev.agent_id, .syscall_id = ev.syscall_id, .question = try allocator.dupe(u8, ev.question) } },
             .message_incomplete => |ev| .{ .message_incomplete = .{ .agent_id = ev.agent_id, .trigger_id = ev.trigger_id, .partial_content = try allocator.dupe(u8, ev.partial_content) } },
             .tool_cancelled => |ev| .{ .tool_cancelled = ev },
-            .finished => |ev| .{ .finished = .{ .agent_id = ev.agent_id, .trigger_id = ev.trigger_id, .final_text = try allocator.dupe(u8, ev.final_text) } },
+            .finished => |ev| .{ .finished = .{ .agent_id = ev.agent_id, .trigger_id = ev.trigger_id, .client_query_id = ev.client_query_id, .final_text = try allocator.dupe(u8, ev.final_text) } },
             .fault => |ev| .{ .fault = .{ .agent_id = ev.agent_id, .message = try allocator.dupe(u8, ev.message) } },
         };
     }
@@ -255,6 +258,7 @@ pub const CancelError = error{
 
 pub const Request = struct {
     id: TriggerId,
+    client_query_id: u64,
     text: ?[]const u8,
     priority: Priority,
 

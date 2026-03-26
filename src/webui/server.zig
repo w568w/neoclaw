@@ -203,7 +203,7 @@ const WsSession = struct {
     fn dispatchCommand(runtime: *loop.Runtime, cmd: protocol.Command) void {
         switch (cmd) {
             .query => |q| {
-                _ = runtime.submitQuery(q.agent_id, q.text, .interactive) catch {};
+                _ = runtime.submitQuery(q.agent_id, q.client_query_id, q.text, .interactive) catch {};
             },
             .reply => |r| {
                 _ = runtime.submitReply(r.agent_id, r.syscall_id, r.text) catch {};

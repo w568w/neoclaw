@@ -512,6 +512,7 @@ const TestHarness = struct {
     collector: EventCollector,
     api_base_owned: []const u8,
     tools_json_owned: []const u8,
+    client_query_ids: loop.IdPool(u64) = .{},
 
     fn init(allocator: Allocator) !*TestHarness {
         tlog("=== TestHarness.init ===", .{});
@@ -590,14 +591,14 @@ const TestHarness = struct {
 
     fn submitQuery(self: *TestHarness, text: []const u8) !loop.SubmitReceipt {
         tlog("submitQuery(new agent, \"{s}\")", .{text});
-        const receipt = try self.runtime.submitQuery(null, text, .interactive);
+        const receipt = try self.runtime.submitQuery(null, self.client_query_ids.allocate(), text, .interactive);
         tlog("submitQuery -> agent={d}, trigger={?}", .{ receipt.agent_id, receipt.trigger_id });
         return receipt;
     }
 
     fn submitQueryToAgent(self: *TestHarness, agent_id: loop.AgentId, text: []const u8) !loop.SubmitReceipt {
         tlog("submitQueryToAgent(agent={d}, \"{s}\")", .{ agent_id, text });
-        const receipt = try self.runtime.submitQuery(agent_id, text, .interactive);
+        const receipt = try self.runtime.submitQuery(agent_id, self.client_query_ids.allocate(), text, .interactive);
         tlog("submitQueryToAgent -> agent={d}, trigger={?}", .{ receipt.agent_id, receipt.trigger_id });
         return receipt;
     }

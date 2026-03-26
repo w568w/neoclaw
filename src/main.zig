@@ -152,6 +152,7 @@ fn runCli(allocator: std.mem.Allocator, stdout: *Io.Writer, runtime: *neoclaw.lo
 
     var sub = runtime.event_log.subscribe(.tail);
     var current_agent_id: ?neoclaw.loop.AgentId = null;
+    var client_query_ids: neoclaw.loop.IdPool(u64) = .{};
 
     try stdout.writeAll("neoclaw interactive chat\n");
     try stdout.writeAll("commands: /exit /quit /clear\n\n");
@@ -176,7 +177,8 @@ fn runCli(allocator: std.mem.Allocator, stdout: *Io.Writer, runtime: *neoclaw.lo
         }
 
         try editor.addHistory(trimmed);
-        const receipt = try runtime.submitQuery(current_agent_id, trimmed, .interactive);
+        const client_query_id = client_query_ids.allocate();
+        const receipt = try runtime.submitQuery(current_agent_id, client_query_id, trimmed, .interactive);
         current_agent_id = receipt.agent_id;
 
         try consumeUntilFinished(allocator, &editor, stdout, runtime, &sub, current_agent_id.?, receipt.trigger_id);

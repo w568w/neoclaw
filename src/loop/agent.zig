@@ -113,23 +113,25 @@ pub const Agent = struct {
             };
 
             var trigger_id: ?loop.TriggerId = null;
+            var client_query_id: ?u64 = null;
             var has_update = false;
 
             switch (mail) {
                 .request => |*req| {
                     trigger_id = req.id;
+                    client_query_id = req.client_query_id;
 
                     // Append user message to history.
                     if (req.takeText()) |text| {
                         const content = allocator.dupe(u8, text) catch |e| {
                             allocator.free(text);
-                            self.emitErrorAndFinish(req.id, @errorName(e));
+                            self.emitErrorAndFinish(req.id, req.client_query_id, @errorName(e));
                             continue;
                         };
                         allocator.free(text);
                         self.history.append(allocator, .{ .role = .user, .content = content }) catch |e| {
                             allocator.free(content);
-                            self.emitErrorAndFinish(req.id, @errorName(e));
+                            self.emitErrorAndFinish(req.id, req.client_query_id, @errorName(e));
                             continue;
                         };
                         has_update = true;
@@ -171,13 +173,13 @@ pub const Agent = struct {
             if (!has_update) continue;
 
             const tid = trigger_id orelse self.trigger_ids.allocate();
-            self.processUpdate(tid) catch |err| switch (err) {
+            self.processUpdate(tid, client_query_id) catch |err| switch (err) {
                 error.Canceled => {
                     self.cancelAllActiveTools();
                     self.drainMailbox();
                     return;
                 },
-                else => self.emitErrorAndFinish(tid, @errorName(err)),
+                else => self.emitErrorAndFinish(tid, client_query_id, @errorName(err)),
             };
         }
     }
@@ -212,10 +214,10 @@ pub const Agent = struct {
 
     // -- Update processing (LLM dialogue loop) --
 
-    fn processUpdate(self: *Agent, trigger_id: loop.TriggerId) !void {
+    fn processUpdate(self: *Agent, trigger_id: loop.TriggerId, client_query_id: ?u64) !void {
         const allocator = self.allocator;
 
-        _ = try self.kernel.emitEvent(.{ .started = .{ .agent_id = self.id, .trigger_id = trigger_id } });
+        _ = try self.kernel.emitEvent(.{ .started = .{ .agent_id = self.id, .trigger_id = trigger_id, .client_query_id = client_query_id } });
         loop.debugLog("processUpdate agent={d} trigger={d}", .{ self.id, trigger_id });
 
         var turn: u32 = 0;
@@ -238,13 +240,14 @@ pub const Agent = struct {
                     _ = self.kernel.emitEvent(.{ .finished = .{
                         .agent_id = self.id,
                         .trigger_id = trigger_id,
+                        .client_query_id = client_query_id,
                         .final_text = final_text,
                     } }) catch {};
                     return err;
                 },
                 else => {
                     loop.debugLog("processUpdate agent={d} callLlm error={s}", .{ self.id, @errorName(err) });
-                    self.emitErrorAndFinish(trigger_id, @errorName(err));
+                    self.emitErrorAndFinish(trigger_id, client_query_id, @errorName(err));
                     return;
                 },
             };
@@ -256,7 +259,7 @@ pub const Agent = struct {
                 const content = try allocator.dupe(u8, response.content);
                 errdefer allocator.free(content);
                 try self.history.append(allocator, .{ .role = .assistant, .content = content });
-                _ = try self.kernel.emitEvent(.{ .finished = .{ .agent_id = self.id, .trigger_id = trigger_id, .final_text = response.content } });
+                _ = try self.kernel.emitEvent(.{ .finished = .{ .agent_id = self.id, .trigger_id = trigger_id, .client_query_id = client_query_id, .final_text = response.content } });
                 loop.debugLog("finished agent={d} trigger={d}", .{ self.id, trigger_id });
                 return;
             }
@@ -299,6 +302,7 @@ pub const Agent = struct {
                         _ = self.kernel.emitEvent(.{ .finished = .{
                             .agent_id = self.id,
                             .trigger_id = trigger_id,
+                            .client_query_id = client_query_id,
                             .final_text = "[CANCELED]",
                         } }) catch {};
                         return err;
@@ -308,12 +312,12 @@ pub const Agent = struct {
             }
         }
 
-        self.emitErrorAndFinish(trigger_id, "[MAX_TURNS_EXCEEDED]");
+        self.emitErrorAndFinish(trigger_id, client_query_id, "[MAX_TURNS_EXCEEDED]");
     }
 
-    fn emitErrorAndFinish(self: *Agent, trigger_id: loop.TriggerId, reason: []const u8) void {
+    fn emitErrorAndFinish(self: *Agent, trigger_id: loop.TriggerId, client_query_id: ?u64, reason: []const u8) void {
         _ = self.kernel.emitEvent(.{ .fault = .{ .agent_id = self.id, .message = reason } }) catch {};
-        _ = self.kernel.emitEvent(.{ .finished = .{ .agent_id = self.id, .trigger_id = trigger_id, .final_text = reason } }) catch {};
+        _ = self.kernel.emitEvent(.{ .finished = .{ .agent_id = self.id, .trigger_id = trigger_id, .client_query_id = client_query_id, .final_text = reason } }) catch {};
     }
 
     fn recordToolResult(self: *Agent, syscall_id: loop.SyscallId, tc_id: []const u8, output: []const u8, ok: bool) !void {

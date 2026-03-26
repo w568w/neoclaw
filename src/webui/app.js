@@ -9,6 +9,8 @@
     agentRunning: false,
     currentAssistantEl: null,
     currentAssistantBuf: "",
+    nextClientQueryId: 1,
+    queryStatusEls: Object.create(null),
   };
 
   var dom = {
@@ -76,9 +78,15 @@
     switch (msg.type) {
       case "accepted":
         state.currentAgentId = msg.agent_id;
+        if (msg.client_query_id != null) {
+          updateQueryStatus(msg.client_query_id, "queued");
+        }
         break;
       case "started":
         setAgentRunning(true);
+        if (msg.client_query_id != null) {
+          updateQueryStatus(msg.client_query_id, "processing");
+        }
         break;
       case "assistant_delta":
         appendAssistantDelta(msg.text);
@@ -111,6 +119,9 @@
       case "finished":
         finalizeAssistant();
         setAgentRunning(false);
+        if (msg.client_query_id != null) {
+          updateQueryStatus(msg.client_query_id, "done");
+        }
         break;
       case "fault":
         addMessage("msg msg-fault", "[fault] " + msg.message);
@@ -125,6 +136,24 @@
     var el = document.createElement("div");
     el.className = className;
     el.textContent = text;
+    dom.messages.appendChild(el);
+    scrollToBottom();
+  }
+
+  function addUserQueryMessage(text, clientQueryId) {
+    var el = document.createElement("div");
+    el.className = "msg msg-user";
+
+    var textSpan = document.createElement("span");
+    textSpan.textContent = text;
+    el.appendChild(textSpan);
+
+    var statusSpan = document.createElement("span");
+    statusSpan.className = "query-status queued";
+    statusSpan.textContent = "queued";
+    el.appendChild(statusSpan);
+
+    state.queryStatusEls[String(clientQueryId)] = statusSpan;
     dom.messages.appendChild(el);
     scrollToBottom();
   }
@@ -362,6 +391,17 @@
     el.textContent = output;
   }
 
+  function updateQueryStatus(clientQueryId, status) {
+    var key = String(clientQueryId);
+    var el = state.queryStatusEls[key];
+    if (!el) return;
+    el.className = "query-status " + status;
+    el.textContent = status;
+    if (status === "done") {
+      delete state.queryStatusEls[key];
+    }
+  }
+
   function addAskPrompt(agentId, syscallId, question) {
     finalizeAssistant();
 
@@ -418,10 +458,13 @@
     var text = dom.input.value.trim();
     if (!text) return;
 
+    var clientQueryId = state.nextClientQueryId;
+    state.nextClientQueryId += 1;
+
     dom.input.value = "";
     autoResizeInput();
-    addMessage("msg msg-user", text);
-    send({ cmd: "query", agent_id: state.currentAgentId, text: text });
+    addUserQueryMessage(text, clientQueryId);
+    send({ cmd: "query", agent_id: state.currentAgentId, client_query_id: clientQueryId, text: text });
   }
 
   function autoResizeInput() {

@@ -41,6 +41,7 @@ fn writeEventPayload(jw: *std.json.Stringify, event: loop.Event) !void {
 pub const Command = union(enum) {
     query: struct {
         agent_id: ?loop.AgentId,
+        client_query_id: u64,
         text: []u8,
     },
     reply: struct {
@@ -87,8 +88,9 @@ pub fn parseCommand(allocator: Allocator, data: []const u8) ParseError!Command {
         const text_val = obj.get("text") orelse return error.MissingField;
         if (text_val != .string) return error.InvalidJson;
         const agent_id = parseOptionalU64(obj.get("agent_id"));
+        const client_query_id = parseOptionalU64(obj.get("client_query_id")) orelse return error.MissingField;
         const text = allocator.dupe(u8, text_val.string) catch return error.OutOfMemory;
-        return .{ .query = .{ .agent_id = agent_id, .text = text } };
+        return .{ .query = .{ .agent_id = agent_id, .client_query_id = client_query_id, .text = text } };
     }
 
     if (std.mem.eql(u8, cmd, "reply")) {

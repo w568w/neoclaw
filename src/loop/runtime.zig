@@ -18,6 +18,7 @@ const InboxItem = struct {
         // External interrupts (from user).
         submit_query: struct {
             agent_id: ?loop.AgentId,
+            client_query_id: u64,
             text: ?[]const u8,
             priority: loop.Priority,
         },
@@ -152,12 +153,13 @@ pub const Runtime = struct {
 
     // -- Public API: external interrupt entry points --
 
-    pub fn submitQuery(self: *Runtime, agent_id: ?loop.AgentId, text: []const u8, priority: loop.Priority) !loop.SubmitReceipt {
+    pub fn submitQuery(self: *Runtime, agent_id: ?loop.AgentId, client_query_id: u64, text: []const u8, priority: loop.Priority) !loop.SubmitReceipt {
         const item = try self.allocator.create(InboxItem);
         errdefer self.allocator.destroy(item);
         item.* = .{
             .msg = .{ .submit_query = .{
                 .agent_id = agent_id,
+                .client_query_id = client_query_id,
                 .text = try self.allocator.dupe(u8, text),
                 .priority = priority,
             } },
@@ -283,12 +285,13 @@ pub const Runtime = struct {
             self.createAgent() catch return .{ .err = error.OutOfMemory };
 
         const trigger_id = agent.trigger_ids.allocate();
-        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .trigger_id = trigger_id } }) catch
+        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = agent.id, .trigger_id = trigger_id, .client_query_id = msg.client_query_id } }) catch
             return .{ .err = error.OutOfMemory };
         loop.debugLog("submit_query agent={d} trigger={d}", .{ agent.id, trigger_id });
 
         agent.enqueueMail(self.allocator, .{ .request = .{
             .id = trigger_id,
+            .client_query_id = msg.client_query_id,
             .text = msg.text.?,
             .priority = msg.priority,
         } }) catch {
@@ -302,7 +305,7 @@ pub const Runtime = struct {
 
     fn handleSubmitReply(self: *Runtime, msg: *@FieldType(InboxItem.Msg, "submit_reply")) InboxItem.Result {
         const agent = self.getAgent(msg.agent_id) orelse return .{ .err = error.UnknownAgent };
-        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .trigger_id = null } }) catch
+        const accepted_seq = self.event_log.append(.{ .accepted = .{ .agent_id = msg.agent_id, .trigger_id = null, .client_query_id = null } }) catch
             return .{ .err = error.OutOfMemory };
         loop.debugLog("submit_reply agent={d} syscall={d}", .{ msg.agent_id, msg.syscall_id });
 
