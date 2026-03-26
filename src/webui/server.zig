@@ -8,6 +8,17 @@ const protocol = @import("protocol.zig");
 const assets = @import("assets.zig");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.webui_server);
+const ProbeResult = struct {
+    reject: bool = false,
+    prefix_len: usize = 0,
+    prefix: [9]u8 = [_]u8{0} ** 9,
+};
+
+const ProbeReadResult = struct {
+    prefix_len: usize = 0,
+    err: ?anyerror = null,
+};
 
 pub const WebServer = struct {
     allocator: Allocator,
@@ -15,8 +26,10 @@ pub const WebServer = struct {
     runtime: *loop.Runtime,
     port: u16,
 
-    tcp_server: ?net.Server = null,
-    accept_future: ?Io.Future(void) = null,
+    tcp_server_v4: ?net.Server = null,
+    tcp_server_v6: ?net.Server = null,
+    accept_future_v4: ?Io.Future(void) = null,
+    accept_future_v6: ?Io.Future(void) = null,
     conn_group: Io.Group = .init,
 
     pub fn init(allocator: Allocator, io: Io, runtime: *loop.Runtime, port: u16) WebServer {
@@ -29,20 +42,53 @@ pub const WebServer = struct {
     }
 
     pub fn start(self: *WebServer) !void {
-        const address = try net.IpAddress.parse("0.0.0.0", self.port);
-        self.tcp_server = try net.IpAddress.listen(&address, self.io, .{ .reuse_address = true });
-        self.accept_future = try self.io.concurrent(acceptLoop, .{self});
+        const address_v4 = try net.IpAddress.parse("0.0.0.0", self.port);
+        self.tcp_server_v4 = try net.IpAddress.listen(&address_v4, self.io, .{ .reuse_address = true });
+        errdefer {
+            if (self.tcp_server_v4) |*server| {
+                server.deinit(self.io);
+                self.tcp_server_v4 = null;
+            }
+        }
+
+        const address_v6 = try net.IpAddress.parse("::", self.port);
+        self.tcp_server_v6 = net.IpAddress.listen(&address_v6, self.io, .{ .reuse_address = true }) catch null;
+        errdefer {
+            if (self.tcp_server_v6) |*server| {
+                server.deinit(self.io);
+                self.tcp_server_v6 = null;
+            }
+        }
+
+        self.accept_future_v4 = try self.io.concurrent(acceptLoop, .{ self, .v4 });
+        errdefer {
+            if (self.accept_future_v4) |*f| {
+                _ = f.cancel(self.io);
+                self.accept_future_v4 = null;
+            }
+        }
+
+        if (self.tcp_server_v6 != null) {
+            self.accept_future_v6 = try self.io.concurrent(acceptLoop, .{ self, .v6 });
+        }
     }
 
     pub fn deinit(self: *WebServer) void {
         // Stop per-connection work first, then stop accepting new connections.
         self.conn_group.cancel(self.io);
-        if (self.accept_future) |*f| _ = f.cancel(self.io);
-        if (self.tcp_server) |*server| server.deinit(self.io);
+        if (self.accept_future_v4) |*f| _ = f.cancel(self.io);
+        if (self.accept_future_v6) |*f| _ = f.cancel(self.io);
+        if (self.tcp_server_v4) |*server| server.deinit(self.io);
+        if (self.tcp_server_v6) |*server| server.deinit(self.io);
     }
 
-    fn acceptLoop(self: *WebServer) void {
-        var server = self.tcp_server orelse return;
+    const ListenFamily = enum { v4, v6 };
+
+    fn acceptLoop(self: *WebServer, family: ListenFamily) void {
+        var server = switch (family) {
+            .v4 => self.tcp_server_v4 orelse return,
+            .v6 => self.tcp_server_v6 orelse return,
+        };
         while (true) {
             const stream = server.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return,
@@ -59,9 +105,19 @@ pub const WebServer = struct {
     fn handleConnection(self: *WebServer, stream: net.Stream) void {
         defer stream.close(self.io);
 
+        const probe = probeConnectionPrefix(self.io, stream);
+        if (probe.reject) {
+            stream.shutdown(self.io, .both) catch {};
+            return;
+        }
+
         var read_buf: [1 << 14]u8 = undefined;
         var write_buf: [1 << 14]u8 = undefined;
         var net_reader = stream.reader(self.io, &read_buf);
+        if (probe.prefix_len != 0) {
+            @memcpy(read_buf[0..probe.prefix_len], probe.prefix[0..probe.prefix_len]);
+            net_reader.interface.end = probe.prefix_len;
+        }
         var net_writer = stream.writer(self.io, &write_buf);
         var server = http.Server.init(&net_reader.interface, &net_writer.interface);
 
@@ -75,6 +131,24 @@ pub const WebServer = struct {
                 // WebSocket upgrade consumed the connection.
                 return;
         }
+    }
+
+    fn probeConnectionPrefix(io: Io, stream: net.Stream) ProbeResult {
+        var result: ProbeResult = .{};
+        const read_result = readProbePrefix(io, stream, &result.prefix);
+        result.prefix_len = read_result.prefix_len;
+        if (read_result.err) |err| {
+            if (err != error.Canceled) {
+                var addr_buf: [96]u8 = undefined;
+                const peer_addr = formatPeerAddress(&addr_buf, stream.socket.address);
+                log.debug("probe read failed peer={s}: {s} ({d} bytes)", .{ peer_addr, @errorName(err), result.prefix_len });
+            }
+            return result;
+        }
+        if (result.prefix_len == 0) return result;
+
+        result.reject = isLikelyTlsClientHello(result.prefix[0..result.prefix_len]);
+        return result;
     }
 
     /// Routes a single HTTP request. Returns `true` when the connection has been
@@ -110,6 +184,50 @@ pub const WebServer = struct {
         return false;
     }
 };
+
+fn isLikelyTlsClientHello(data: []const u8) bool {
+    if (data.len < 5) return false;
+    if (data[0] != 0x16 or data[1] != 0x03 or data[2] > 0x04) return false;
+    if (std.mem.readInt(u16, data[3..5], .big) == 0) return false;
+    if (data.len >= 6 and data[5] != 0x01) return false;
+    return true;
+}
+
+fn readProbePrefix(io: Io, stream: net.Stream, buf: []u8) ProbeReadResult {
+    var total: usize = 0;
+    while (total < buf.len) {
+        var vec = [_][]u8{buf[total..]};
+        const n = io.vtable.netRead(io.userdata, stream.socket.handle, vec[0..]) catch |err| {
+            return .{ .prefix_len = total, .err = err };
+        };
+        if (n == 0) return .{ .prefix_len = total };
+
+        total += n;
+
+        if (total >= 1 and buf[0] != 0x16) return .{ .prefix_len = total };
+        if (total >= 2 and buf[1] != 0x03) return .{ .prefix_len = total };
+        if (total >= 3 and buf[2] > 0x04) return .{ .prefix_len = total };
+        if (total >= 5) return .{ .prefix_len = total };
+    }
+    return .{ .prefix_len = total };
+}
+
+fn formatPeerAddress(buf: *[96]u8, addr: net.IpAddress) []const u8 {
+    return switch (addr) {
+        .ip4 => |a| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3], a.port }) catch "unknown",
+        .ip6 => |a| std.fmt.bufPrint(buf, "[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]:{d}", .{
+            std.mem.readInt(u16, a.bytes[0..2], .big),
+            std.mem.readInt(u16, a.bytes[2..4], .big),
+            std.mem.readInt(u16, a.bytes[4..6], .big),
+            std.mem.readInt(u16, a.bytes[6..8], .big),
+            std.mem.readInt(u16, a.bytes[8..10], .big),
+            std.mem.readInt(u16, a.bytes[10..12], .big),
+            std.mem.readInt(u16, a.bytes[12..14], .big),
+            std.mem.readInt(u16, a.bytes[14..16], .big),
+            a.port,
+        }) catch "unknown",
+    };
+}
 
 // -- URI parsing helpers --
 
