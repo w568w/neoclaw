@@ -2,6 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+pub const build_options = @import("build_options");
 pub const llm = @import("llm/mod.zig");
 pub const openai = @import("llm/openai.zig");
 pub const codex = @import("llm/codex.zig");

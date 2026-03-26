@@ -1,10 +1,13 @@
 const std = @import("std");
 const http = std.http;
+const build_options = @import("build_options");
 
 pub const Asset = struct {
     content: []const u8,
     mime: []const u8,
 };
+
+pub const server_header = "neoclaw/" ++ build_options.version;
 
 const file_map = std.StaticStringMap(Asset).initComptime(.{
     .{ "/", Asset{ .content = @embedFile("index.html"), .mime = "text/html; charset=utf-8" } },
@@ -19,6 +22,7 @@ pub fn servePath(request: *http.Server.Request, path: []const u8) !void {
             .extra_headers = &.{
                 .{ .name = "content-type", .value = asset.mime },
                 .{ .name = "cache-control", .value = "no-cache" },
+                .{ .name = "server", .value = server_header },
             },
         });
     } else {
@@ -26,6 +30,7 @@ pub fn servePath(request: *http.Server.Request, path: []const u8) !void {
             .status = .not_found,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/plain" },
+                .{ .name = "server", .value = server_header },
             },
         });
     }

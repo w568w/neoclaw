@@ -4,6 +4,7 @@ const clap = @import("clap");
 const Io = std.Io;
 
 const neoclaw = @import("neoclaw");
+const build_options = neoclaw.build_options;
 const dotenv = @import("dotenv.zig");
 const cacert = @import("generated/cacert.zig");
 const LineEditor = @import("line_editor/editor.zig").LineEditor;
@@ -30,6 +31,7 @@ const CliOptions = struct {
 
 const cli_params = clap.parseParamsComptime(
     \\-h, --help       Display this help and exit.
+    \\-V, --version    Display version and exit.
     \\-p, --port <u16> WebUI port (default: 3120).
     \\    --webui      Run in WebUI mode instead of CLI.
     \\
@@ -48,6 +50,11 @@ fn parseArgs(args: std.process.Args, io: Io) CliOptions {
 
     if (res.args.help != 0) {
         clap.helpToFile(io, .stdout(), clap.Help, &cli_params, .{}) catch {};
+        std.process.exit(0);
+    }
+
+    if (res.args.version != 0) {
+        printVersion(io) catch {};
         std.process.exit(0);
     }
 
@@ -109,6 +116,20 @@ pub fn main(init: std.process.Init) !void {
         .webui => try runWebUI(allocator, io, stdout, &runtime, opts.port),
         .cli => try runCli(allocator, stdout, &runtime),
     }
+}
+
+fn printVersion(io: Io) !void {
+    var out_buf: [512]u8 = undefined;
+    var out: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    try out.interface.print("neoclaw {s}\n", .{build_options.version});
+    try out.interface.print("commit: {s}\n", .{build_options.git_commit});
+    try out.interface.print("target: {s}-{s}-{s}\n", .{
+        @tagName(builtin.target.cpu.arch),
+        @tagName(builtin.target.os.tag),
+        @tagName(builtin.target.abi),
+    });
+    try out.interface.print("optimize: {s}\n", .{@tagName(builtin.mode)});
+    try out.interface.flush();
 }
 
 fn runWebUI(allocator: std.mem.Allocator, io: Io, stdout: *Io.Writer, runtime: *neoclaw.loop.Runtime, port: u16) !void {

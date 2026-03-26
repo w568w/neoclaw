@@ -157,7 +157,10 @@ pub const WebServer = struct {
         const parsed = parseTarget(request.head.target) catch {
             request.respond("bad request", .{
                 .status = .bad_request,
-                .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }},
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/plain" },
+                    .{ .name = "server", .value = assets.server_header },
+                },
             }) catch {};
             return false;
         };
@@ -175,7 +178,10 @@ pub const WebServer = struct {
 
             request.respond("WebSocket upgrade required", .{
                 .status = .bad_request,
-                .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }},
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/plain" },
+                    .{ .name = "server", .value = assets.server_header },
+                },
             }) catch {};
             return false;
         }

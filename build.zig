@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const app_version = b.option([]const u8, "app_version", "Application version string") orelse "0.0.0-dev";
+    const git_commit = detectGitCommit(b);
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption([]const u8, "git_commit", git_commit);
 
     const gen_unicode_exe = b.addExecutable(.{
         .name = "gen-grapheme-tables",
@@ -31,6 +37,9 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("neoclaw", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
     });
 
     const clap = b.dependency("clap", .{});
@@ -47,6 +56,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.build_id = .fast;
 
     b.installArtifact(exe);
 
@@ -98,4 +108,14 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("integration-test", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+}
+
+fn detectGitCommit(b: *std.Build) []const u8 {
+    var code: u8 = 0;
+    const stdout = b.runAllowFail(&.{ "git", "rev-parse", "--short=12", "HEAD" }, &code, .ignore) catch return "unknown";
+    defer b.allocator.free(stdout);
+
+    const trimmed = std.mem.trimEnd(u8, stdout, "\r\n");
+    if (trimmed.len == 0) return "unknown";
+    return b.allocator.dupe(u8, trimmed) catch "unknown";
 }
