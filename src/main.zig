@@ -129,11 +129,9 @@ fn waitForCtrlC(io: Io) void {
     const raw_ok = terminal.enableRawMode() catch false;
     if (!raw_ok) {
         // stdin is not a terminal (e.g. pipe, background process).
-        // Block forever; the process can only be stopped by SIGTERM.
-        var buf: [16]u8 = undefined;
-        var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &buf);
-        _ = stdin_reader.interface.takeArray(1) catch {};
-        return;
+        // Sleep forever so the WebUI keeps serving without consuming the Io runtime.
+        const sleep_timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(3600), .clock = .awake } };
+        while (true) sleep_timeout.sleep(io) catch {};
     }
     defer terminal.disableRawMode();
 
