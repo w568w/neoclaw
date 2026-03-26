@@ -12,7 +12,10 @@
     nextClientQueryId: 1,
     queryStatusEls: Object.create(null),
     askPrompts: Object.create(null),
+    stickToBottom: true,
   };
+
+  var BOTTOM_THRESHOLD_PX = 48;
 
   var dom = {
     messages: document.getElementById("messages"),
@@ -162,7 +165,7 @@
 
     state.queryStatusEls[String(clientQueryId)] = statusSpan;
     dom.messages.appendChild(el);
-    scrollToBottom();
+    scrollToBottom(true);
   }
 
   function appendAssistantDelta(text) {
@@ -420,6 +423,7 @@
 
   function addAskPrompt(agentId, syscallId, question) {
     finalizeAssistant();
+    var shouldFocus = isNearBottom();
 
     var el = document.createElement("div");
     el.className = "ask-prompt";
@@ -471,8 +475,6 @@
       e.preventDefault();
       submitReply();
     };
-    inp.focus();
-    scrollToBottom();
 
     state.askPrompts[String(syscallId)] = {
       el: el,
@@ -481,6 +483,11 @@
       agentId: agentId,
       status: "active",
     };
+
+    if (shouldFocus) {
+      inp.focus();
+    }
+    scrollToBottom();
   }
 
   function expireAskPrompt(syscallId, reason) {
@@ -527,8 +534,18 @@
     dom.input.style.height = Math.min(dom.input.scrollHeight, 150) + "px";
   }
 
-  function scrollToBottom() {
+  function distanceFromBottom() {
+    return dom.messages.scrollHeight - dom.messages.scrollTop - dom.messages.clientHeight;
+  }
+
+  function isNearBottom() {
+    return distanceFromBottom() <= BOTTOM_THRESHOLD_PX;
+  }
+
+  function scrollToBottom(force) {
+    if (!force && !state.stickToBottom) return;
     dom.messages.scrollTop = dom.messages.scrollHeight;
+    state.stickToBottom = true;
   }
 
   // -- Minimal Markdown renderer --
@@ -609,6 +626,9 @@
   // -- Initialization --
 
   dom.btnSend.onclick = submitQuery;
+  dom.messages.addEventListener("scroll", function () {
+    state.stickToBottom = isNearBottom();
+  });
   dom.input.onkeydown = function (e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
