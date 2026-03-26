@@ -150,7 +150,8 @@
 
     var statusSpan = document.createElement("span");
     statusSpan.className = "query-status queued";
-    statusSpan.textContent = "queued";
+    statusSpan.title = "排队中";
+    statusSpan.setAttribute("aria-label", "排队中");
     el.appendChild(statusSpan);
 
     state.queryStatusEls[String(clientQueryId)] = statusSpan;
@@ -396,7 +397,16 @@
     var el = state.queryStatusEls[key];
     if (!el) return;
     el.className = "query-status " + status;
-    el.textContent = status;
+    if (status === "queued") {
+      el.title = "排队中";
+      el.setAttribute("aria-label", "排队中");
+    } else if (status === "processing") {
+      el.title = "处理中";
+      el.setAttribute("aria-label", "处理中");
+    } else {
+      el.title = "已完成";
+      el.setAttribute("aria-label", "已完成");
+    }
     if (status === "done") {
       delete state.queryStatusEls[key];
     }

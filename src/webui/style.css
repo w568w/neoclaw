@@ -62,26 +62,77 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  position: relative;
+  padding-right: 28px;
 }
 .query-status {
-  font-size: 11px;
-  line-height: 1;
-  padding: 2px 6px;
+  position: absolute;
+  right: 10px;
+  bottom: 6px;
+  width: 15px;
+  height: 15px;
+  color: #dbe6ff;
+  opacity: 0.95;
+  pointer-events: none;
+}
+.query-status::before,
+.query-status::after {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+}
+
+.query-status.queued::before {
+  inset: 1px;
+  border: 1.4px solid var(--yellow);
+  border-radius: 50%;
+}
+.query-status.queued::after {
+  left: 7px;
+  top: 2px;
+  width: 1.6px;
+  height: 6px;
+  background: var(--yellow);
+  transform-origin: bottom center;
+  transform: rotate(32deg);
+  border-radius: 1px;
+}
+
+.query-status.processing::before {
+  left: 0;
+  top: 5px;
+  width: 15px;
+  height: 5px;
+  border: 1px solid rgba(224, 175, 104, 0.65);
   border-radius: 999px;
-  font-family: var(--font-mono);
-  border: 1px solid transparent;
 }
-.query-status.queued {
-  color: var(--yellow);
-  border-color: var(--yellow);
+.query-status.processing::after {
+  top: 6px;
+  left: 1px;
+  width: 5px;
+  height: 3px;
+  background: var(--orange);
+  border-radius: 999px;
+  animation: query-progress 900ms linear infinite;
 }
-.query-status.processing {
-  color: var(--orange);
-  border-color: var(--orange);
+
+.query-status.done::before {
+  left: 4px;
+  top: 4px;
+  width: 7px;
+  height: 4px;
+  border-left: 2px solid var(--green);
+  border-bottom: 2px solid var(--green);
+  transform: rotate(-45deg);
 }
-.query-status.done {
-  color: var(--green);
-  border-color: var(--green);
+
+@keyframes query-progress {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(8px);
+  }
 }
 .msg-assistant {
   background: var(--bg-secondary); border: 1px solid var(--border); align-self: flex-start;
